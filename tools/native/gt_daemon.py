@@ -585,6 +585,16 @@ PAGE = r"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
    <input type="number" id="corner_px" min="0" max="24" step="1"></div>
   <div class="row"><label>右上角用 OpenGlass 按钮<div class="hint">挖掉 Chromium 按钮区，让 OpenGlass 画 Win7 胶囊按钮（本体点击会被转发）</div></label>
    <input type="checkbox" id="gl_buttons"></div>
+  <div class="row"><label>胶囊右缘留白 <span class="hint">DIP，OpenGlass 画的是 Win7 指标（默认 7）</span></label>
+   <input type="number" id="btn_pad_right_px" min="0" max="30" step="1"></div>
+  <div class="row"><label>−/□ 胶囊宽度 <span class="hint">DIP（默认 30）</span></label>
+   <input type="number" id="btn_min_px" min="10" max="80" step="1"></div>
+  <div class="row"><label>✕ 胶囊宽度 <span class="hint">DIP（默认 50）</span></label>
+   <input type="number" id="btn_close_px" min="10" max="120" step="1"></div>
+  <div class="row"><label>胶囊顶部偏移 <span class="hint">DIP，相对窗口顶部（默认 0）</span></label>
+   <input type="number" id="btn_top_px" min="0" max="40" step="1"></div>
+  <div class="row"><label>胶囊高度 <span class="hint">DIP，0 = 整条标签带</span></label>
+   <input type="number" id="btn_h_px" min="0" max="120" step="1"></div>
  </div>
 
  <div class="card off">
@@ -622,7 +632,7 @@ PAGE = r"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 </div>
 <div id="toast"></div>
 <script>
-const F=['frame_px','corner_px','gl_buttons','theme','tab_max_width','tab_min_width','tab_radius','hover','favicons','wheel_tabs','autostart','port'];
+const F=['frame_px','corner_px','gl_buttons','btn_pad_right_px','btn_min_px','btn_close_px','btn_top_px','btn_h_px','theme','tab_max_width','tab_min_width','tab_radius','hover','favicons','wheel_tabs','autostart','port'];
 let s={};
 function toast(t){const e=document.getElementById('toast');e.textContent=t;e.classList.add('show');
   setTimeout(()=>e.classList.remove('show'),1600);}

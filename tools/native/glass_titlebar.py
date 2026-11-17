@@ -430,6 +430,31 @@ def frame_region(win, cuts, inset=0, radius=0):
     return rgn
 
 
+def win7_caption_buttons(win, band, scale, cfg):
+    """Screen rects of the Windows 7 caption capsules that OpenGlass paints in the hole.
+
+    `CaptionButtons=2` uses Win7 metrics: min/max 30 DIP wide, close 50 DIP, the group's
+    right edge 7 DIP in from the window edge. Chromium's own buttons are 46 DIP wide and end
+    ~6 DIP in, so the two sets are offset by tens of pixels at 200% DPI: forwarding clicks by
+    the UIA rects made a click on the drawn `−` hit Chromium's `□` (FINDINGS §11.12).
+    The hole and the hit table must both come from *these* rects.
+    """
+    pad = int(round(cfg.btn_pad_right_px * scale))
+    minw = max(4, int(round(cfg.btn_min_px * scale)))
+    closew = max(4, int(round(cfg.btn_close_px * scale)))
+    top = win[1] + int(round(cfg.btn_top_px * scale))
+    height = int(round(cfg.btn_h_px * scale)) if cfg.btn_h_px else (band[3] - band[1])
+    bottom = top + max(8, height)
+    close_r = win[2] - pad
+    out = {}
+    out["close"] = (close_r - closew, top, close_r, bottom)
+    max_r = close_r - closew
+    out["max"] = (max_r - minw, top, max_r, bottom)
+    min_r = max_r - minw
+    out["min"] = (min_r - minw, top, min_r, bottom)
+    return out
+
+
 def comb_region(win, band, keep):
     """Window region with the strip *background* cut out and `keep` rects left untouched.
 
@@ -498,6 +523,15 @@ class Settings:
         "frame_px": 4,             # CSS px; thin glass frame on all four sides
         "corner_px": 6,            # CSS px; radius of the two top corners of the frame
         "gl_buttons": True,        # hand the top-right corner to OpenGlass caption buttons
+        # OpenGlass CaptionButtons=2 draws *Windows 7* metrics; Chromium's own buttons are
+        # 46 DIP wide with a different right margin, so hit-testing the UIA rects makes a
+        # click on a drawn capsule fire its neighbour (FINDINGS 11.12). These describe the
+        # set that is actually painted inside the hole.
+        "btn_pad_right_px": 7,     # DIP; right edge of the capsule group -> window right edge
+        "btn_min_px": 30,          # DIP; width of the minimise AND maximise capsule
+        "btn_close_px": 50,        # DIP; width of the close capsule
+        "btn_top_px": 0,           # DIP; capsule top relative to the window top
+        "btn_h_px": 0,             # DIP; capsule height, 0 = the whole tab band
         "tab_max_width": 220,      # CSS px; Win7/Chrome caps tabs at 220
         "tab_min_width": 70,
         "tab_radius": 6,
@@ -1501,11 +1535,11 @@ class InputHook:
 
 
 class CaptionHook(threading.Thread):
-    """Forward clicks in the OpenGlass caption corner to the window.
+    """Block mouse input in the OpenGlass caption corner.
 
     That corner is a region *hole* (so OpenGlass paints its Win7 buttons there), which means
-    Windows never delivers those clicks to the window -- they fall through to whatever is
-    behind it. This hook catches them and posts the matching WM_SYSCOMMAND instead.
+    Windows routes input to whatever is behind the browser. The low-level hook swallows it
+    before it can activate the desktop, the browser, or a caption command.
     """
 
     SC = {"min": 0xF020, "max": 0xF030, "restore": 0xF120, "close": 0xF060}
@@ -1514,7 +1548,8 @@ class CaptionHook(threading.Thread):
         super().__init__(daemon=True, name="caption-hook")
         self.target = target
         self.area = None            # the holed corner, screen coords
-        self.buttons = {}           # name -> rect
+        self.buttons = {}           # name -> rect (the *drawn* Win7 capsules)
+        self.native = ()            # Chromium's own caption-button rects (never to be used)
         self.pending = None
         self.down = False
         self.resizing = None
@@ -1555,10 +1590,11 @@ class CaptionHook(threading.Thread):
     def _ask_fg(self):
         self.q.put(("fg", None))
 
-    def set_area(self, area, buttons):
+    def set_area(self, area, buttons, native=None):
         with self.lock:
             self.area = area
             self.buttons = {k: v for k, v in buttons.items() if v}
+            self.native = tuple(r for r in (native or ()) if r)
 
     def set_frame(self, win, n):
         """Geometry of the four thin hole strips, so clicks there can resize/activate."""
@@ -1598,6 +1634,20 @@ class CaptionHook(threading.Thread):
                 return name
         return None
 
+    def _capsule_x(self, x):
+        """Capsule name whose horizontal span contains `x` (vertical extent ignored)."""
+        for name, r in self.buttons.items():
+            if r[0] <= x < r[2]:
+                return name
+        return None
+
+    def _native_button(self, x, y):
+        """True when (x, y) sits on one of Chromium's own caption buttons."""
+        for r in self.native:
+            if r[0] <= x < r[2] and r[1] <= y < r[3]:
+                return True
+        return False
+
     def _hook(self, code, wparam, lparam):
         self.last_event_ts = time.time()
         if code < 0:
@@ -1616,6 +1666,22 @@ class CaptionHook(threading.Thread):
                 return u32.CallNextHookEx(None, code, wparam, lparam)
             a = self.area
             inside = bool(a) and a[0] <= x < a[2] and a[1] <= y < a[3]
+            if inside:
+                self.moving = None
+                self.resizing = None
+                self.restore_drag = None
+                self.pending = None
+                self.down = False
+                return 1
+            if msg == WM_MOUSEMOVE and (self.moving or self.resizing or self.restore_drag) \
+                    and not (u32.GetAsyncKeyState(0x01) & 0x8000):
+                self.moving = None
+                self.resizing = None
+                self.restore_drag = None
+                self.down = False
+                self.pending = None
+                trace("stale drag cleared: left button is up")
+                return u32.CallNextHookEx(None, code, wparam, lparam)
             if (self.moving or self.resizing) and msg in (WM_LBUTTONDOWN, WM_MOUSEMOVE):
                 # A latch must never survive a button-up it never saw (a second hook copy or
                 # another app swallowing the click): the window then "snaps back" on every
@@ -1654,6 +1720,18 @@ class CaptionHook(threading.Thread):
                             self.moving = (window_rect(self.target), (x, y))
                         self.drag_t0 = time.time()
                     return 1            # never let it reach the desktop behind the hole
+                elif self._native_button(x, y):
+                    # A Chromium caption-button pixel that the hole does not cover at this
+                    # instant (the first frame after an attach or a resume, a band that has not
+                    # stabilised yet). The native buttons are invisible there, so letting one
+                    # of them fire is always wrong: route the click to the capsule drawn at the
+                    # same x, i.e. behave exactly as if the hole were already up.
+                    self.pending = self._capsule_x(x)
+                    self.down = True
+                    self.drag_t0 = time.time()
+                    self._ask_fg()
+                    trace(f"native button blocked ({x},{y}) -> {self.pending}")
+                    return 1
             elif msg == WM_MOUSEMOVE and self.restore_drag:
                 x0, y0, mr, ratio = self.restore_drag
                 if abs(x - x0) + abs(y - y0) > 8:
@@ -1831,6 +1909,7 @@ def attach_loop(hwnd, cfg, scale, dry_run=False, stop_event=None, log=print):
     painted_sig = None
     last_paint = 0.0
     last_cap = 0.0
+    btn_sig = None
 
     def restore_regions():
         """Parent AND D3D child, otherwise the native strip stays clipped (or the hole stays)."""
@@ -1931,13 +2010,27 @@ def attach_loop(hwnd, cfg, scale, dry_run=False, stop_event=None, log=print):
                 # OpenGlass caption corner is subtracted on top of it.
                 cuts = []
                 if cfg.gl_buttons and snap.band:
-                    # Cut over the native caption buttons; UIA gives us their real rects.
-                    btn_left = min((r[0] for r in (snap.min_r, snap.max_r, snap.close_r) if r),
-                                   default=None)
-                    if btn_left is None:
-                        x = win[2] - int(3 * 46 * scale) - int(10 * scale)
+                    # Two geometries have to agree: the hole (what OpenGlass paints in) starts
+                    # at the right of the native `+` -- that area is empty strip background and
+                    # the `+` keeps its own hit-testing -- while the capsule hit table comes
+                    # from the *drawn* Win7 metrics, never from Chromium's UIA button rects
+                    # (46 DIP wide, 6 DIP right margin: tens of px off at 200% DPI, which is
+                    # why clicking the drawn `−` used to fire the native `□`).
+                    btns = win7_caption_buttons(win, snap.band, scale, cfg)
+                    native = (snap.min_r, snap.max_r, snap.close_r)
+                    x = btns["min"][0] - int(2 * scale)        # hole always covers the capsules
+                    if snap.newtab_r:
+                        x = min(x, snap.newtab_r[2] + int(2 * scale))
                     else:
-                        x = btn_left - int(6 * scale)
+                        btn_left = min((r[0] for r in native if r), default=None)
+                        if btn_left is not None:
+                            x = min(x, btn_left - int(6 * scale))
+                    # Chromium's own buttons must sit fully inside the hole as well: wherever one
+                    # pokes out, a click can still reach it. (The hook blocks those clicks too,
+                    # but a hole that covers them is the cheaper guarantee.)
+                    for r in native:
+                        if r:
+                            x = min(x, r[0] - int(2 * scale))
                     x = max(win[0] + n, x) // 2 * 2
                     corner = (x, snap.band[1] // 2 * 2, win[2], snap.band[3] // 2 * 2)
                     # bottom-left corner rounded: the window keeps a small arc where the cut
@@ -1945,8 +2038,11 @@ def attach_loop(hwnd, cfg, scale, dry_run=False, stop_event=None, log=print):
                     cuts.extend(round_corner_cut(corner[0], corner[1], corner[2], corner[3],
                                                  max(3, int(round(6 * scale)))))
                     if cap:
-                        cap.set_area(corner, {"min": snap.min_r, "max": snap.max_r,
-                                              "close": snap.close_r})
+                        cap.set_area(corner, btns, native)
+                    if btns != btn_sig:
+                        btn_sig = btns
+                        trace("buttons hole=%s %s" % (corner, " ".join(
+                            f"{k}={v}" for k, v in btns.items())))
                 elif cap:
                     cap.set_area(None, {})
                 cuts = tuple(cuts)

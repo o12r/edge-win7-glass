@@ -8,6 +8,9 @@
 Windows 上所有 Chromium 系浏览器窗口被守护进程接管：四边各切 `frame_px`（默认 4 CSS px）
 露出 OpenGlass 玻璃，右上角（`+` 右侧到窗口右缘、标签带高度）整块挖掉，由 OpenGlass 画
 Win7 胶囊按钮 `− □ ✕`；那个角落的点击由 `CaptionHook` 转成 `WM_SYSCOMMAND` 发回窗口。
+**命中表按 Win7 胶囊指标算（`win7_caption_buttons()`），不用 UIA 里 Chromium 的按钮矩形**
+——两套几何差 4~60 px，点画出来的 `−` 会落到原生 `□` 上（FINDINGS §11.13）。空白处拖动/
+双击最大化，四边手写缩放也在这个钩子里。
 **标签条完全是 Chromium 原生的**：图标、文字、关闭按钮、命中、拖拽重排都不用我们操心。
 洞里的任何点击都会把窗口拉到前台；拖四边的手动缩放也在 `CaptionHook` 里实现（get 不到
 Chromium 自己的 resize 边框）。**全屏（F11）不接管**：只清一次 region 就撒手，否则
@@ -131,9 +134,10 @@ GLASS_TITLEBAR_DUMP=1             # → %TEMP%\gt_last.png（实际送进 Update
 - `tools/native/glass_titlebar.py` — 当前主工具（`frame_region` + 原生标签 + `CaptionHook`；
   自绘那套 `layout_tabs`/`render`/`Overlay`/`Favicons` 仍在文件里但未接线）
 - `tools/native/gt_daemon.py` — 守护进程 + 托盘 + 设置页
-- `tools/native/glass_strip.py` — 旧路线（只挖缝隙，含 `ClickGuard` 钩子原型）
+- `tools/native/launch.bat` — 无控制台启动守护进程
 - `tools/native/launch_scratch.py` — 临时 profile 启动器
-- `tools/native/ogprobe.cpp` / `ogprobe.dll` — 进程内 DWM/样式探针（注入用，本轮未再使用）
+- `tools/native/ogprobe.cpp` / `build.bat` — 进程内 DWM/样式探针源码（本轮未用；`build.bat` 重新编出 dll）
+- `tools/capmain.ps1` / `tools/shot2.ps1` — 按 msedge 主窗口 / 全屏截图取证
 - `docs/settings.md` — settings.json 各字段说明（含哪些已停用）
 - `FINDINGS.md` — §8 挖洞路线、§9 自绘观感、§10 守护进程、§11 原生标签 + 窄边（最新）
 

@@ -1,5 +1,10 @@
 # FINDINGS — 已做的实验与结论
 
+> 注：本文是实验记录。第一轮用的一次性探针脚本已清理，`tools/` 现在只剩生产链路
+> （`native/glass_titlebar.py`、`native/gt_daemon.py`、`native/launch_scratch.py`、`native/launch.bat`）、
+> 取证脚本（`capmain.ps1`、`shot2.ps1`）和探针源码（`native/ogprobe.cpp` + `native/build.bat`）。
+> 下文提到的其他脚本要复现，请从 git 历史取（提交 `a343f9f` 与 `42fdc0d` 之间）。
+
 ## 1. 环境盘点（实测）
 
 | 项 | 值 |
@@ -468,3 +473,33 @@ OpenGlass 的 `CaptionButtons=2` 是 **Windows 7 指标**：min/max 各 30 DIP �
 min → `iconic=True`、max → `zoomed=True`，日志 `hit=max / caption click -> max`。
 
 
+
+### 11.13 洞向左扩到 `+` 右侧后，命中表要跟着回到 Win7 指标
+
+洞的左缘从"按钮组左边 − 6 px"改成"原生 `+` 右缘 + 2 DIP"（中间那段是 Chromium 的空标签条
+背景，交给 OpenGlass 画玻璃不影响任何功能，`+` 自己留在洞外仍是原生命中）。改完立刻出现
+"点画出来的胶囊，触发的是 Edge 原生那一套" —— 因为挖洞跟着 `+` 走，而**转发命中**又退回用了
+UIA 里 Chromium 的按钮矩形（46 DIP 宽、右缘距窗口 6 DIP），和 OpenGlass 画的 Win7 胶囊
+（30/30/50 DIP、右缘 7 DIP）在 200% 屏上横向差 4~60 px，`−` 会落到原生 `□` 上。
+
+现在两套几何各司其职，都在 `attach_loop` 里算：
+
+- 洞：`x = min(胶囊左缘 − 2 DIP, 原生 + 右缘 + 2 DIP)`，再夹到 `win.left + frame`。
+- 命中：`win7_caption_buttons()` 按 DIP 指标算 `close/max/min` 三个矩形，同时喂给
+  `CaptionHook.set_area`（`− □ ✕` → `SC_MINIMIZE / SC_MAXIMIZE|SC_RESTORE / SC_CLOSE`，
+  胶囊之间的空白仍是"拖动窗口 / 双击最大化"）。
+- 5 个新设置项（设置页可调，DIP）：`btn_pad_right_px=7`、`btn_min_px=30`、
+  `btn_close_px=50`、`btn_top_px=0`、`btn_h_px=0`（0 = 用整条标签带高度）。
+- 每次接管往日志写一行 `buttons hole=(...) close=(...) max=(...) min=(...)`，实测最大化
+  窗口（`win.right=2573`）：`close 2459-2559 / max 2399-2459 / min 2339-2399`，即右缘 −14 px、
+  三个胶囊 100/60/60 px，和 §11.12 的截图像素列一致。
+
+命中兜底（"原生按钮绝不触发"）三层：
+
+1. **洞盖住原生按钮**：左缘除了 `+` 右缘、胶囊左缘之外，再取 `min(..., 原生 min_r[0] − 2 DIP)`
+   —— Chromium 的按钮组和 OpenGlass 画的胶囊横向量出来差 9~53 px（实测原生
+   `2286/2376/2468/2560`，胶囊 `2339/2399/2459/2559`），光靠胶囊矩形会让原生按钮露出一截。
+2. **钩子兜底**：`area` 里的左键走胶囊表；不在 `area` 但落在原生按钮矩形里的左键
+   （接管第一帧、band 还没稳定、region 被清过）也不给应用，按同 x 对应的胶囊转发
+   `WM_SYSCOMMAND`，日志 `native button blocked (x,y) -> min|max|close`。
+3. **右/中键与滚轮在洞里一律吞掉**（`return 1`），不再漏给桌面或下层窗口。

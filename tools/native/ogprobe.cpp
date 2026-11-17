@@ -1,6 +1,7 @@
 // ogprobe.dll - in-process probe for the "transparent Chromium tabstrip" project.
 //
-// Loaded into msedge.exe / chrome.exe by ogprobe_inject.py. It:
+// Loaded into msedge.exe / chrome.exe by a remote-thread injector (the original
+// ogprobe_inject.py was pruned; see git history a343f9f for it). It:
 //   1. finds the browser's top-level Chrome_WidgetWin_* windows,
 //   2. logs style / exstyle / window rect / client origin to ogprobe.log,
 //   3. applies the recipe picked in ogprobe.ini:

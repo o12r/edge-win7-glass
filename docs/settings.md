@@ -30,6 +30,11 @@
 | `frame_px` | CSS px | 四边各切多宽露出玻璃（按 DPI 缩放；默认 4 → 200% 屏上 8 物理像素） |
 | `corner_px` | CSS px | 上面两个角（以及右上角挖口）的圆角半径，0 = 直角，默认 6 |
 | `gl_buttons` | bool | `true` 挖掉右上角按钮区，由 OpenGlass 画 Win7 胶囊按钮；`false` 保留 Chromium 原生按钮 |
+| `btn_pad_right_px` | DIP | 胶囊组右缘到窗口右缘的距离（Win7 是 7）。OpenGlass `CaptionButtons=2` 用这套指标 |
+| `btn_min_px` | DIP | `−` 和 `□` 每个胶囊的宽度（Win7 30） |
+| `btn_close_px` | DIP | `✕` 胶囊宽度（Win7 50） |
+| `btn_top_px` | DIP | 胶囊顶部相对窗口顶部的偏移，默认 0 |
+| `btn_h_px` | DIP | 胶囊高度，0 = 用整条标签带的高度 |
 | `port` | int | 设置页端口，默认 8721（占用时自动 +1） |
 | `autostart` | bool | 开机自启（写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`） |
 
