@@ -37,7 +37,11 @@ timeout /t 1 >nul
 echo [2/5] 复制文件到 %DEST%
 if not exist "%DEST%" mkdir "%DEST%" >nul 2>&1
 copy /y "%SRC%%EXENAME%" "%DEST%\%EXENAME%" >nul || (echo [错误] 复制失败 & pause & exit /b 1)
-copy /y "%~f0" "%DEST%\Uninstall.bat" >nul
+if exist "%SRC%uninstall.bat" (
+    copy /y "%SRC%uninstall.bat" "%DEST%\Uninstall.bat" >nul
+) else (
+    echo [警告] 缺少 uninstall.bat，卸载项将无法使用（可手动删除 %DEST%）
+)
 if exist "%SRC%README.txt" copy /y "%SRC%README.txt" "%DEST%\README.txt" >nul
 if exist "%SRC%settings.md" copy /y "%SRC%settings.md" "%DEST%\settings.md" >nul
 

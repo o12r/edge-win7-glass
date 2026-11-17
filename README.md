@@ -33,13 +33,19 @@
 
 ## 安装
 
-### 一、下载 exe（推荐）
+### 一、直接用现成的 exe（推荐）
 
-到 [Releases](../../releases) 下载 `EdgeWin7Glass-1.0.0.zip`，解压后双击 `install.bat`：
+仓库里的 **[`release/`](release/) 目录就是完整的免安装包**，`EdgeWin7Glass.exe` 已经在里面：
 
-- 安装到 `%LOCALAPPDATA%\Programs\EdgeWin7Glass`（**不需要管理员**），创建开始菜单 + 桌面快捷方式，
-  注册卸载项，写开机自启（`install.bat /noautostart` 可跳过），然后直接启动；
-- 卸载：设置 → 应用 → 已安装的应用 → *Edge Win7 Glass*，或运行安装目录里的 `Uninstall.bat`。
+- **安装到系统**（开始菜单 + 桌面快捷方式 + 卸载项 + 开机自启）：双击 `release\install.bat`；
+- **不安装**：直接双击 `release\EdgeWin7Glass.exe` 常驻运行。
+
+也可以到 [Releases](../../releases) 下载打包好的 `EdgeWin7Glass-1.0.0.zip`（内容与 `release/` 相同）。
+
+- 安装位置：`%LOCALAPPDATA%\Programs\EdgeWin7Glass`（**不需要管理员**）；`install.bat /noautostart` 可跳过开机自启；
+- **卸载**：设置 → 应用 → 已安装的应用 → *Edge Win7 Glass*，或双击 `release\uninstall.bat`
+  （也会被复制到安装目录的 `Uninstall.bat`）。卸载会优雅退出守护进程、还原窗口形状、
+  删除快捷方式和注册表项；设置和日志默认保留，加 `/purge` 一起删。
 
 ### 二、从源码跑
 
@@ -117,8 +123,11 @@ tools/native/
   gt_i18n.py          托盘/设置页的中英文文案
   launch.bat          无控制台启动守护进程
 release/
+  EdgeWin7Glass.exe   打包好的程序（PyInstaller onefile，免安装可直接运行）
   install.bat         一键安装（复制到 %LOCALAPPDATA%，建快捷方式，注册卸载）
-  README.txt          随 zip 分发的用户说明
+  uninstall.bat       一键卸载（/purge 连设置和日志一起删）
+  README.txt          随包分发的用户说明
+  settings.md         settings.json 字段说明（随包附带）
 docs/
   settings.md                  settings.json 字段说明
   FINDINGS.md                  开发记录与根因分析
@@ -136,8 +145,13 @@ requirements.txt      运行时依赖（comtypes）
     --paths tools/native tools/native/gt_daemon.py
 ```
 
-把 `dist/EdgeWin7Glass.exe`、`release/install.bat`、`release/README.txt`、`docs/settings.md`
-放进同一个文件夹，压成 `EdgeWin7Glass-<版本>.zip` 就是 Releases 里那个包。
+打包 = 把新 exe 放进 `release/`，再把 `release/` 里五个文件压成 `EdgeWin7Glass-<版本>.zip`：
+
+```bash
+cp dist/EdgeWin7Glass.exe release/
+cd release && "/c/Program Files/7-Zip/7z.exe" a -tzip ../dist/EdgeWin7Glass-1.0.0.zip \
+    EdgeWin7Glass.exe install.bat uninstall.bat README.txt settings.md
+```
 
 ## 许可
 
