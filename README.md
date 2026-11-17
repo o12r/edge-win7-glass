@@ -4,17 +4,17 @@
 换上 **Windows 7 Aero 玻璃标题栏**：四边各切一条窄边露出 DWM 玻璃，右上角整块挖掉交给
 [OpenGlass](docs/openglass-config-reference.md) 画 Win7 胶囊按钮 `− □ ✕`，标签条保持 Chromium **原生**。
 
-```
-┌──────────────────────────────────────────────────────────┐
-│  ╭──────────────────────────────────────────────────╮    │  ← 顶部窄边：玻璃
-│  │ Tab1  Tab2  ✕   +    ⟳        [ −  □  ✕ ]        │    │  ← 原生标签 + OpenGlass 胶囊
-│  ├──────────────────────────────────────────────────┤    │
-│  │  地址栏 / 页面内容                                 │    │
-│  ╰──────────────────────────────────────────────────╯    │
-└──────────────────────────────────────────────────────────┘
-```
+**之前** —— 现代 Edge 自绘标题栏：顶部一条不透明，右上角是 Chromium 自己的 `− □ ✕`。
 
-不是主题替换、不注入浏览器进程、改的是**窗口形状**（`SetWindowRgn`）：
+![未启用](img/initial.png)
+
+**之后** —— 四边露出玻璃，右上角换成 OpenGlass 画的 Win7 胶囊按钮，标签依旧原生。
+
+![启用后](img/effect.png)
+
+> 截图里的窗口外观来自 [Aero11: Seven](https://github.com/Sand216/Aero11)（Aero10 的 Win11 移植版，
+> Windows 7 主题）+ OpenGlass 提供的玻璃与胶囊按钮。本项目不替换主题、不注入浏览器进程，
+> 它只改**窗口形状**（`SetWindowRgn`）：
 
 1. 四边各切 `frame_px`（默认 5 CSS px），露出 DWM 本来就在那儿渲染的玻璃；
 2. 右上角从原生 `+` 右侧到窗口右缘整块挖掉，让 OpenGlass 在那里画 Win7 指标的胶囊按钮；
@@ -29,6 +29,7 @@
 | Windows 11 | 依赖 DWM 的系统玻璃 |
 | [OpenGlass](https://github.com/ALTaleX531/OpenGlass) | 系统玻璃/圆角/胶囊按钮都由它提供，**必须装** |
 | OpenGlass 配置 | `CaptionButtons = 2`（Win7 指标的三颗胶囊）、`CornerRadius` 与设置里的 `corner_px` 一致（默认 10）。详见 [docs/openglass-config-reference.md](docs/openglass-config-reference.md) |
+| 主题（可选，截图即此配置） | [Aero11](https://github.com/Sand216/Aero11) 之类的 Win7 主题，给窗口带来 Win7 的边框/配色；不装也能用，只是边框观感偏 Win11 |
 
 ## 安装
 
@@ -122,6 +123,8 @@ docs/
   settings.md                  settings.json 字段说明
   FINDINGS.md                  开发记录与根因分析
   openglass-config-reference.md OpenGlass 配置说明（上游文档快照）
+img/
+  initial.png / effect.png     README 里的前后对比截图
 requirements.txt      运行时依赖（comtypes）
 ```
 
