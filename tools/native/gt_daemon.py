@@ -17,6 +17,7 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -84,6 +85,8 @@ def _setup_win32():
     u32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
     u32.DispatchMessageW.restype = ctypes.c_ssize_t
     u32.PostQuitMessage.argtypes = [ctypes.c_int]
+    u32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+    u32.PostMessageW.restype = wt.BOOL
     shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
     shell32.Shell_NotifyIconW.restype = wt.BOOL
 
@@ -117,6 +120,40 @@ def process_exe(hwnd):
     finally:
         k32.CloseHandle(h)
     return ""
+
+
+def process_path(hwnd):
+    """Full executable path of the process that owns `hwnd` (to relaunch it later)."""
+    pid = wt.DWORD()
+    u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    h = k32.OpenProcess(0x1000, False, pid)         # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wt.DWORD(1024)
+        if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return buf.value
+    finally:
+        k32.CloseHandle(h)
+    return ""
+
+
+def process_user_data_dir(hwnd):
+    """`--user-data-dir` value of the process owning `hwnd`, or None (default profile)."""
+    pid = wt.DWORD()
+    u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    try:
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid.value}').CommandLine"],
+            capture_output=True, text=True, timeout=8)
+        m = re.search(r"--user-data-dir=([\"']?)([^\"' ]+)", r.stdout)
+        if m:
+            return m.group(2)
+    except Exception:
+        pass
+    return None
 
 
 def window_class(h):
@@ -415,13 +452,82 @@ class Daemon:
             json.dump(data, f, indent=2, ensure_ascii=False)
         if "autostart" in new:
             set_autostart(bool(new["autostart"]))
-        old_port = self.cfg.port
-        self.cfg = gt.Settings()
         log(f"settings saved: {new}")
+        # Hot-reconnect (detach + re-attach) leaves stale overlay/region state behind, so
+        # applying settings now does a clean restart: close the browsers (saving their
+        # session), relaunch the daemon, and reopen the browsers with their tabs restored.
+        # Delayed so the HTTP "ok" response reaches the settings page before os._exit kills us.
+        threading.Timer(0.5, self.restart_everything).start()
+
+    def restart_everything(self):
+        """Clean restart: close browsers (saving session), relaunch daemon, reopen browsers.
+
+        Replaces the old detach+re-attach, which left the touch overlay / window region in a
+        stale state (clicks landing on a dead overlay, a hole that stayed cut). A full process
+        restart starts from a clean slate.
+        """
+        self.stopping = True            # the watcher must not re-attach while we tear down
+        # Collect the browsers we manage (before detach_all clears `attached`), so GT_ONLY_HWND
+        # restarts only that window's browser and never touches unrelated browser windows.
+        paths = []
+        seen = set()
+        for h in list(self.attached.keys()):
+            p = process_path(h)
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            paths.append([p, process_user_data_dir(h)])
         self.detach_all()
-        if self.cfg.port != old_port:
-            self.start_http()
-        self.scan()
+        restore = os.path.join(APP_DATA, "restore.json")
+        try:
+            with open(restore, "w", encoding="utf-8") as f:
+                json.dump(paths, f)
+        except OSError:
+            pass
+        log(f"closing {len(paths)} browser(s) for restart")
+        exes = {p[0] for p in paths}
+        # Graceful close (WM_CLOSE) so Chromium saves the session; --restore-last-session
+        # needs the session file written on exit. Close every window of the target browsers.
+        for h in browser_windows():
+            if process_path(h) in exes:
+                u32.PostMessageW(h, 0x0010, 0, 0)      # WM_CLOSE
+        for _ in range(40):                            # wait for the windows to close
+            if not any(process_path(h) in exes for h in browser_windows()):
+                break
+            time.sleep(0.1)
+        time.sleep(2.0)                                # let the process finish writing its session
+        self.relaunch_daemon()
+
+    def relaunch_daemon(self):
+        exe = sys.executable.replace("python.exe", "pythonw.exe")
+        cmd = f'"{exe}" "{os.path.abspath(__file__)}"'
+        subprocess.Popen(cmd, shell=True)
+        log("daemon relaunched; exiting")
+        os._exit(0)
+
+    def restore_browsers(self):
+        """Reopen the browsers we closed, restoring their last session (tabs)."""
+        restore = os.path.join(APP_DATA, "restore.json")
+        if not os.path.exists(restore):
+            return
+        try:
+            with open(restore, encoding="utf-8") as f:
+                paths = json.load(f)
+            os.remove(restore)
+        except (OSError, ValueError):
+            return
+        for item in paths:
+            exe = item[0] if isinstance(item, (list, tuple)) else item
+            udd = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else None
+            cmd = [exe]
+            if udd:
+                cmd.append(f"--user-data-dir={udd}")
+            cmd.append("--restore-last-session")
+            try:
+                subprocess.Popen(cmd, creationflags=0x08000000)
+                log(f"restored browser {exe}" + (f" (profile {udd})" if udd else ""))
+            except Exception as e:
+                log(f"restore browser failed {exe}: {e!r}")
 
     def command(self, cid):
         if cid == 1:
@@ -490,6 +596,7 @@ class Daemon:
             return 0
         self._mutex = mutex
         set_autostart(bool(self.cfg.autostart))
+        self.restore_browsers()         # reopen browsers closed by a settings restart
         self.start_http()
         threading.Thread(target=self._watcher, name="watcher", daemon=True).start()
         self.tray = Tray(self)
@@ -595,6 +702,8 @@ PAGE = r"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
    <input type="number" id="btn_top_px" min="0" max="40" step="1"></div>
   <div class="row"><label>胶囊高度 <span class="hint">DIP，0 = 整条标签带</span></label>
    <input type="number" id="btn_h_px" min="0" max="120" step="1"></div>
+  <div class="row"><label>挖孔高度修正 <span class="hint">DIP，负值减小（挖孔底部侵入窗口内容区时设为负，如 -3）</span></label>
+   <input type="number" id="btn_h_fix_px" min="-40" max="40" step="1"></div>
  </div>
 
  <div class="card off">
@@ -632,13 +741,13 @@ PAGE = r"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 </div>
 <div id="toast"></div>
 <script>
-const F=['frame_px','corner_px','gl_buttons','btn_pad_right_px','btn_min_px','btn_close_px','btn_top_px','btn_h_px','theme','tab_max_width','tab_min_width','tab_radius','hover','favicons','wheel_tabs','autostart','port'];
+const F=['frame_px','corner_px','gl_buttons','btn_pad_right_px','btn_min_px','btn_close_px','btn_top_px','btn_h_px','btn_h_fix_px','theme','tab_max_width','tab_min_width','tab_radius','hover','favicons','wheel_tabs','autostart','port'];
 let s={};
 function toast(t){const e=document.getElementById('toast');e.textContent=t;e.classList.add('show');
   setTimeout(()=>e.classList.remove('show'),1600);}
-async function load(){
+async function load(fill=true){
   const r=await fetch('/api/status');const j=await r.json();s=j.settings;
-  for(const k of F){const el=document.getElementById(k);if(!el)continue;
+  if(fill)for(const k of F){const el=document.getElementById(k);if(!el)continue;
     if(el.type==='checkbox')el.checked=!!s[k];else el.value=s[k];}
   const st=document.getElementById('state');
   st.textContent=j.paused?'已暂停':(j.windows.length+' 个窗口');
@@ -651,14 +760,14 @@ document.getElementById('save').onclick=async()=>{
   for(const k of F){const el=document.getElementById(k);
     out[k]= el.type==='checkbox'?el.checked:(el.type==='number'?Number(el.value):el.value);}
   const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(out)});
-  if(r.ok){toast('已保存，正在重新接管窗口');setTimeout(load,1200);}else toast('保存失败');
+  if(r.ok){toast('已保存，正在重新接管窗口');setTimeout(()=>load(true),1200);}else toast('保存失败');
 };
-document.getElementById('refresh').onclick=load;
+document.getElementById('refresh').onclick=()=>load(true);
 document.getElementById('quit').onclick=async()=>{
   if(!confirm('退出守护进程？所有窗口的玻璃标题栏会恢复成原生样式。'))return;
   await fetch('/api/quit',{method:'POST'});document.body.innerHTML='<p style="padding:40px">守护进程已退出。</p>';
 };
-load();setInterval(load,4000);
+load(true);setInterval(()=>load(false),4000);
 </script></html>
 """
 

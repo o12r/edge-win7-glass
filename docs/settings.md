@@ -35,6 +35,7 @@
 | `btn_close_px` | DIP | `✕` 胶囊宽度（Win7 50） |
 | `btn_top_px` | DIP | 胶囊顶部相对窗口顶部的偏移，默认 0 |
 | `btn_h_px` | DIP | 胶囊高度，0 = 用整条标签带的高度 |
+| `btn_h_fix_px` | DIP | 挖孔高度修正，负值减小；挖孔底部侵入窗口内容区时设为负（如 −3），默认 0 |
 | `port` | int | 设置页端口，默认 8721（占用时自动 +1） |
 | `autostart` | bool | 开机自启（写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`） |
 

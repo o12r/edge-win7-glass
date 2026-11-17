@@ -8,13 +8,11 @@ window then redraws the tabs, the new-tab button and the window buttons on top o
 Tab text/state/rects and the button rects come from UI Automation, so the redrawn bar follows
 tab open/close/selection and window resizes.
 
-Interactions handled by the overlay:
-  click tab        -> SelectionItemPattern.Select on that tab
-  click tab close  -> Invoke on that tab's "Close tab" button
-  click +          -> Ctrl+T to the browser
-  click min/max/x  -> WM_SYSCOMMAND on the browser window
-  drag empty area  -> move window
-  double-click     -> toggle maximize
+This tool is VISUAL ONLY: it never installs a mouse hook, never swallows a click and never
+moves or resizes the window itself. Everything the browser owns (tab strip, its own caption
+buttons, dragging, resizing, keyboard) stays 100% native. The one exception is documented
+elsewhere: the OpenGlass caption corner is a region hole, so a click there lands on whatever
+is behind the browser (the desktop) instead of on a button.
 
 usage
   python glass_titlebar.py --hwnd 0x20FC4
@@ -29,20 +27,17 @@ import ctypes.wintypes as wt
 import json
 import os
 import queue
-import re
 import sys
 import threading
 import time
 
 import comtypes.client
-from PIL import Image, ImageChops, ImageDraw, ImageFont
 from comtypes.gen import UIAutomationClient as UIA
 
 u32 = ctypes.windll.user32
 gdi = ctypes.windll.gdi32
 k32 = ctypes.windll.kernel32
 u32.SetProcessDPIAware()
-sys.setswitchinterval(0.001)     # fast GIL hand-off: the mouse hook thread must never wait
 
 DEBUG = os.environ.get("GLASS_TITLEBAR_DEBUG") == "1"
 DEBUG_LOG = os.path.join(os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP", "."),
@@ -56,7 +51,7 @@ _log_q = queue.Queue()
 
 
 def dbg(msg):
-    """Never touch the disk on the caller's thread: the mouse hook must return in <300 ms."""
+    """Never touch the disk on the caller's thread: callers are latency sensitive."""
     if DEBUG:
         _log_q.put(msg)
 
@@ -85,14 +80,6 @@ def _log_writer():
 threading.Thread(target=_log_writer, daemon=True).start()
 
 
-_VOLATILE = re.compile(r"\d+(?:[.,]\d+)?\s*(?:MB|GB|KB|B)\b")
-
-
-def _stable(name):
-    """Drop volatile numbers (memory usage in the tab title) so signatures stay stable."""
-    return _VOLATILE.sub("#", name)
-
-
 GWL_STYLE = -16
 WS_MAXIMIZE = 0x01000000
 WS_EX_TOOLWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE = 0x80, 0x00080000, 0x08000000
@@ -103,8 +90,11 @@ SW_MAXIMIZE, SW_RESTORE, SW_MINIMIZE = 3, 9, 6
 WM_SYSCOMMAND, SC_MINIMIZE, SC_MAXIMIZE, SC_RESTORE, SC_CLOSE = 0x0112, 0xF020, 0xF030, 0xF120, 0xF060
 MA_NOACTIVATE = 3
 AC_SRC_OVER, AC_SRC_ALPHA = 0x00, 0x01
-SRCCOPY = 0x00CC0020
 ULW_ALPHA = 0x02
+WM_MOUSEACTIVATE = 0x0021
+WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0200, 0x0201, 0x0202
+WM_RBUTTONDOWN, WM_MBUTTONDOWN = 0x0204, 0x0207
+SW_SHOWNOACTIVATE = 4
 
 CW = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
 
@@ -161,20 +151,7 @@ gdi.CreateDIBSection.argtypes = [wt.HDC, ctypes.POINTER(BITMAPINFO), wt.UINT,
 
 WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wt.HWND, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t)
 
-WH_MOUSE_LL = 14
-WM_APP = 0x8000
-LLMHF_INJECTED = 0x01
-WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0200, 0x0201, 0x0202
-WM_RBUTTONDOWN, WM_RBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP = 0x0204, 0x0205, 0x0207, 0x0208
-WM_MOUSEWHEEL = 0x020A
-WM_NCLBUTTONDOWN = 0x00A1
-HTCAPTION = 2
-HT_EDGE = {"l": 10, "r": 11, "t": 12, "tl": 13, "tr": 14, "b": 15, "bl": 16, "br": 17}
-
-
-class MSLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [("pt", POINT), ("mouseData", wt.DWORD), ("flags", wt.DWORD),
-                ("time", wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+HTTRANSPARENT = -1
 
 
 class WNDCLASS(ctypes.Structure):
@@ -206,13 +183,6 @@ class Snapshot:
         self.win, self.band, self.tabs = win, band, tabs
         self.min_r, self.max_r, self.close_r = min_r, max_r, close_r
         self.newtab_r, self.search_r = newtab_r, search_r
-
-    def signature(self):
-        # Tab titles carry volatile bits ("Memory usage - 106 MB"); collapse them so the bar
-        # is not repainted several times a second (that starves the mouse hook).
-        return (self.win, self.band,
-                self.min_r, self.max_r, self.close_r, self.newtab_r,
-                tuple((_stable(t["name"]), t["rect"], t["selected"]) for t in self.tabs))
 
 
 def clone_snapshot(snap, win):
@@ -310,14 +280,6 @@ class UiaWorker:
                 rects["newtab"] = r
             elif name == "Search tabs":
                 rects["search"] = r
-            elif name == "Close tab":
-                # attach to the tab whose rect contains it
-                for t in tabs:
-                    tr = t["rect"]
-                    if tr[0] <= r[0] <= tr[2] and tr[1] <= r[1] <= tr[3]:
-                        t["close_el"] = el
-                        t["close_rect"] = r
-                        break
         return Snapshot(win, band, tabs, rects.get("min"), rects.get("max"),
                         rects.get("close"), rects.get("newtab"), rects.get("search"))
 
@@ -336,31 +298,6 @@ class UiaWorker:
 def window_rect(h):
     r = RECT(); u32.GetWindowRect(h, ctypes.byref(r))
     return r.left, r.top, r.right, r.bottom
-
-
-def clip_region(win, hole):
-    wx0, wy0, wx1, wy1 = win
-    W, H = wx1 - wx0, wy1 - wy0
-    a, b, c, d = hole
-    a, b, c, d = max(0, a - wx0), max(0, b - wy0), min(W, c - wx0), min(H, d - wy0)
-    if c <= a or d <= b:
-        return None
-    ys = sorted({0, b, d, H})
-    rgn = gdi.CreateRectRgn(0, 0, 0, 0)
-    for i in range(len(ys) - 1):
-        y1, y2 = ys[i], ys[i + 1]
-        if y2 <= y1:
-            continue
-        hole_band = (b <= y1 and d >= y2)
-        xs = [0, a, c, W] if hole_band else [0, W]
-        for j in range(len(xs) - 1):
-            x1, x2 = xs[j], xs[j + 1]
-            if x2 <= x1 or (hole_band and a <= x1 and x2 <= c):
-                continue
-            rr = gdi.CreateRectRgn(x1, y1, x2, y2)
-            gdi.CombineRgn(rgn, rgn, rr, 2)
-            gdi.DeleteObject(rr)
-    return rgn
 
 
 def round_corner_cut(x0, y0, x1, y1, r):
@@ -400,7 +337,7 @@ def is_fullscreen(hwnd, win):
             win[2] >= m.right and win[3] >= m.bottom)
 
 
-def frame_region(win, cuts, inset=0, radius=0):
+def frame_region(win, cuts, inset=0, radius=0, left=0):
     """Window region = inset rounded rectangle (glass frame) minus `cuts` (screen coords).
 
     The inset gives the four-sided glass frame; `radius` rounds the two TOP corners so the
@@ -409,14 +346,22 @@ def frame_region(win, cuts, inset=0, radius=0):
     wx0, wy0, wx1, wy1 = win
     W, H = wx1 - wx0, wy1 - wy0
     if inset > 0:
-        x0, y0, x1, y1 = inset, inset, W - inset + 1, H - inset + 1
+        x0, y0, x1, y1 = max(inset, left), inset, W - inset + 1, H - inset + 1
     else:
         x0, y0, x1, y1 = 0, 0, W, H
+    def arc_off(r, i):
+        """Horizontal inset of row i (0 = top) of a quarter circle of radius r."""
+        dy = r - (i + 0.5)
+        return r - int(round(max(0.0, r * r - dy * dy) ** 0.5))
+
     if radius > 0 and (x1 - x0) > 2 * radius and (y1 - y0) > 2 * radius:
-        rgn = gdi.CreateRoundRectRgn(x0, y0, x1, y1, 2 * radius, 2 * radius)
-        sq = gdi.CreateRectRgn(x0, y0 + radius, x1, y1)      # square off the bottom corners
-        gdi.CombineRgn(rgn, rgn, sq, 2)                      # RGN_OR
-        gdi.DeleteObject(sq)
+        # Exact scanline quarter circles (CreateRoundRectRgn's ellipse is lumpy).
+        rgn = gdi.CreateRectRgn(x0, y0 + radius, x1, y1)
+        for i in range(radius):
+            off = arc_off(radius, i)
+            rr = gdi.CreateRectRgn(x0 + off, y0 + i, x1 - off, y0 + i + 1)
+            gdi.CombineRgn(rgn, rgn, rr, 2)
+            gdi.DeleteObject(rr)
     else:
         rgn = gdi.CreateRectRgn(x0, y0, x1, y1)
     for (l, t, r, b) in cuts:
@@ -427,6 +372,15 @@ def frame_region(win, cuts, inset=0, radius=0):
         rr = gdi.CreateRectRgn(cx0, cy0, cx1, cy1)
         gdi.CombineRgn(rgn, rgn, rr, 4)                 # RGN_DIFF
         gdi.DeleteObject(rr)
+        # Convex quarter circle where the cut's left edge meets the frame's top edge.
+        if radius > 0 and cy0 <= y0 and cx1 >= W - 1 and cx0 - x0 > radius:
+            for i in range(radius):
+                off = arc_off(radius, i)
+                if off <= 0:
+                    continue
+                rr = gdi.CreateRectRgn(cx0 - off, y0 + i, cx0, y0 + i + 1)
+                gdi.CombineRgn(rgn, rgn, rr, 4)
+                gdi.DeleteObject(rr)
     return rgn
 
 
@@ -455,29 +409,6 @@ def win7_caption_buttons(win, band, scale, cfg):
     return out
 
 
-def comb_region(win, band, keep):
-    """Window region with the strip *background* cut out and `keep` rects left untouched.
-
-    Native-tab mode (see FINDINGS §11): the native tab bodies stay pixel-identical (real
-    favicons, real close buttons, real drag-reorder) and only the strip background behind
-    them becomes glass.
-    """
-    wx0, wy0, wx1, wy1 = win
-    W, H = wx1 - wx0, wy1 - wy0
-    cut = gdi.CreateRectRgn(0, band[1] - wy0, W, band[3] - wy0)
-    for r in keep:
-        if not r:
-            continue
-        rr = gdi.CreateRectRgn(max(0, r[0] - wx0 - 1), max(0, r[1] - wy0),
-                               min(W, r[2] - wx0 + 1), min(H, r[3] - wy0))
-        gdi.CombineRgn(cut, cut, rr, 4)                 # RGN_DIFF
-        gdi.DeleteObject(rr)
-    whole = gdi.CreateRectRgn(0, 0, W, H)
-    gdi.CombineRgn(whole, whole, cut, 4)
-    gdi.DeleteObject(cut)
-    return whole
-
-
 def d3d_child(hwnd):
     """Chromium paints the whole browser UI (tab strip included) into its D3D child window
     with DirectComposition. A region on the top-level window does NOT clip that child, so the
@@ -498,16 +429,25 @@ def d3d_child(hwnd):
     return max(out)[1] if out else None
 
 
-def child_cut_region(child, hole):
-    """Same band removed, but in the D3D child's local coordinates."""
-    if not child or not u32.IsWindow(child):
-        return None
-    cr = window_rect(child)
-    W, H = cr[2] - cr[0], cr[3] - cr[1]
-    cut = hole[3] - cr[1]
-    if cut <= 0 or cut >= H:
-        return None
-    return gdi.CreateRectRgn(-1, cut, W + 1, H + 1)
+def force_foreground(h):
+    """SetForegroundWindow from a background process needs a thread-input attach."""
+    if not h or not u32.IsWindow(h):
+        return
+    if u32.GetForegroundWindow() == h:
+        return
+    fg = u32.GetForegroundWindow()
+    me = k32.GetCurrentThreadId()
+    other = u32.GetWindowThreadProcessId(fg, None) if fg else 0
+    attached = False
+    if other and other != me:
+        attached = bool(u32.AttachThreadInput(me, other, True))
+    try:
+        u32.BringWindowToTop(h)
+        u32.SetForegroundWindow(h)
+        u32.SetFocus(h)
+    finally:
+        if attached:
+            u32.AttachThreadInput(me, other, False)
 
 
 # ------------------------------------------------------------------ settings / layout
@@ -532,12 +472,7 @@ class Settings:
         "btn_close_px": 50,        # DIP; width of the close capsule
         "btn_top_px": 0,           # DIP; capsule top relative to the window top
         "btn_h_px": 0,             # DIP; capsule height, 0 = the whole tab band
-        "tab_max_width": 220,      # CSS px; Win7/Chrome caps tabs at 220
-        "tab_min_width": 70,
-        "tab_radius": 6,
-        "hover": True,
-        "favicons": True,
-        "wheel_tabs": True,        # wheel over the tab strip switches tabs
+        "btn_h_fix_px": 0,         # DIP; 挖孔高度修正，负值减小（解决挖孔底部侵入窗口内容区）
         "port": 8721,              # local settings page
         "autostart": False,
     }
@@ -564,1066 +499,104 @@ class Settings:
             raise AttributeError(k)
 
 
-def layout_tabs(snap, scale, cfg):
-    """Win7-style strip: equal widths, capped at tab_max_width, left aligned, 1px-ish gaps.
-
-    Tab rects from UIA are only used for identity/icon positions -- Chromium makes the last
-    tab eat all the space, which is not what Win7 looked like.
-    """
-    band = snap.band
-    n = len(snap.tabs)
-    if not band or not n:
-        return []
-    start = band[0] + int(1 * scale)
-    if snap.search_r:
-        start = max(start, snap.search_r[2] + int(2 * scale))
-    limit = (snap.newtab_r[0] - int(2 * scale)) if snap.newtab_r else band[2] - int(8 * scale)
-    gap = max(1, int(2 * scale))
-    avail = max(40 * scale, limit - start)
-    max_w = max(60, int(cfg.tab_max_width * scale))
-    min_w = max(30, int(cfg.tab_min_width * scale))
-    w = min(max_w, max(min_w, int((avail - gap * (n - 1)) / n)))
-    out = []
-    x = start
-    for _ in range(n):
-        out.append((x, band[1], x + w, band[3]))
-        x += w + gap
-    return out
-
-
-def _screen_grab(box):
-    """BitBlt a screen rect into an RGB PIL image (fast; ImageGrab is 3x slower)."""
-    x, y, x1, y1 = box
-    w, h = max(1, x1 - x), max(1, y1 - y)
-    screen = u32.GetDC(None)
-    mem = gdi.CreateCompatibleDC(screen)
-    hbmp = gdi.CreateCompatibleBitmap(screen, w, h)
-    old = gdi.SelectObject(mem, hbmp)
-    gdi.BitBlt(mem, 0, 0, w, h, screen, x, y, SRCCOPY)
-    gdi.SelectObject(mem, old)
-    bmi = BITMAPINFO()
-    bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-    bmi.bmiHeader.biWidth = w
-    bmi.bmiHeader.biHeight = -h
-    bmi.bmiHeader.biPlanes = 1
-    bmi.bmiHeader.biBitCount = 32
-    buf = ctypes.create_string_buffer(w * h * 4)
-    gdi.GetDIBits(mem, hbmp, 0, h, buf, ctypes.byref(bmi), 0)
-    gdi.DeleteObject(hbmp)
-    gdi.DeleteDC(mem)
-    u32.ReleaseDC(None, screen)
-    return Image.frombuffer("RGBA", (w, h), buf.raw, "raw", "BGRA", 0, 1).convert("RGB")
-
-
-def key_icon(crop, light_theme=True):
-    """Turn a captured 16px tab icon into RGBA: knock the tab background out by colour
-    distance from the corners, so glyph icons sit on our light tab without a dark box.
-
-    A white glyph captured off Chromium's dark tab would be invisible on a light tab, so
-    low-saturation pixels get recoloured to the theme's text colour (alpha is kept)."""
-    rgb = crop.convert("RGB")
-    w, h = rgb.size
-    corners = [rgb.getpixel(p) for p in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1),
-                                         (w // 2, 0), (w // 2, h - 1))]
-    bg = tuple(sorted(c[i] for c in corners)[len(corners) // 2] for i in range(3))
-    diff = ImageChops.difference(rgb, Image.new("RGB", (w, h), bg)).convert("L")
-    alpha = diff.point(lambda v: 0 if v <= 12 else min(255, (v - 12) * 9))
-    if alpha.getextrema()[1] < 40:          # nothing but background -> caller falls back
-        return None
-    mask = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=max(2, w // 6), fill=255)
-    alpha = ImageChops.multiply(alpha, mask)
-    out = rgb.convert("RGBA")
-    out.putalpha(alpha)
-    # recolour monochrome glyphs so they read on our tab colour
-    src = out.load()
-    dark_ink, light_ink = (64, 68, 76), (226, 231, 238)
-    for y in range(h):
-        for x in range(w):
-            r, g, b, al = src[x, y]
-            if al < 30:
-                continue
-            if max(r, g, b) - min(r, g, b) > 48:      # coloured site icon: leave it alone
-                continue
-            lum = 0.299 * r + 0.587 * g + 0.114 * b
-            if light_theme and lum > 105:
-                src[x, y] = (*dark_ink, al)
-            elif not light_theme and lum < 120:
-                src[x, y] = (*light_ink, al)
-    return out
-
-
-class Favicons:
-    """Real tab icons, grabbed from the browser itself.
-
-    The strip is cut out of the window and PrintWindow honours SetWindowRgn (the hole comes
-    back black), so a capture means: clear the region, print the D3D child, restore. To keep
-    that invisible the overlay first freezes the current screen (glass included) as an opaque
-    frame, so the native bar never shows through for the ~80 ms the region is cleared.
-    """
-
-    def __init__(self, target, scale, cfg):
-        self.target = target
-        self.scale = scale
-        self.cfg = cfg
-        self.cache = {}
-        self.miss = {}          # title -> time of last failed capture
-        self.child = None
-        u32.EnumChildWindows.argtypes = [wt.HWND, ctypes.c_void_p, wt.LPARAM]
-        u32.PrintWindow.argtypes = [wt.HWND, wt.HDC, wt.UINT]
-        u32.PrintWindow.restype = wt.BOOL
-
-    def _dx3_child(self):
-        if self.child and u32.IsWindow(self.child):
-            return self.child
-        self.child = d3d_child(self.target)
-        return self.child
-
-    def _print(self, h):
-        r = window_rect(h)
-        w, hh = r[2] - r[0], r[3] - r[1]
-        screen = u32.GetDC(None)
-        mem = gdi.CreateCompatibleDC(screen)
-        bmi = BITMAPINFO()
-        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.bmiHeader.biWidth = w
-        bmi.bmiHeader.biHeight = -hh
-        bmi.bmiHeader.biPlanes = 1
-        bmi.bmiHeader.biBitCount = 32
-        bits = ctypes.c_void_p()
-        hbmp = gdi.CreateDIBSection(mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
-        old = gdi.SelectObject(mem, hbmp)
-        ok = u32.PrintWindow(h, mem, 2)          # PW_RENDERFULLCONTENT
-        data = ctypes.string_at(bits, w * hh * 4)
-        gdi.SelectObject(mem, old)
-        gdi.DeleteObject(hbmp)
-        gdi.DeleteDC(mem)
-        u32.ReleaseDC(None, screen)
-        if not ok:
-            return None
-        return Image.frombuffer("RGBA", (w, hh), data, "raw", "BGRA", 0, 1), r
-
-    def missing(self, snap):
-        now = time.time()
-        want = []
-        for t in snap.tabs:
-            k = _stable(t["name"])
-            if k in self.cache or (k in self.miss and now - self.miss[k] < 20):
-                continue
-            want.append(t)
-        return want
-
-    def capture(self, snap, overlay, hole, win):
-        """One capture round for the tabs whose icon we do not know yet."""
-        want = self.missing(snap)
-        child = self._dx3_child()
-        if not want or not child or not hole:
-            return False
-        box = (hole[0], hole[1], hole[2], hole[3])
-        overlay.freeze(box)                     # hide the native bar we are about to expose
-        u32.SetWindowRgn(self.target, None, True)
-        if child:
-            u32.SetWindowRgn(child, None, True)
-        u32.RedrawWindow(self.target, None, None, 0x0001 | 0x0080 | 0x0100)
-        got = None
-        try:
-            got = self._print(child)
-        finally:
-            rgn = clip_region(win, hole)
-            if rgn:
-                u32.SetWindowRgn(self.target, rgn, True)
-            if child:
-                crgn = child_cut_region(child, hole)
-                if crgn:
-                    u32.SetWindowRgn(child, crgn, True)
-        if not got:
-            return False
-        cap, cr = got
-        s = int(16 * self.scale)
-        H = hole[3] - hole[1]
-        cy = hole[1] + (H - s) // 2
-        for t in want:
-            k = _stable(t["name"])
-            x0 = t["rect"][0] + int(8 * self.scale)
-            lx, ly = x0 - cr[0], cy - cr[1]
-            if lx < 0 or ly < 0 or lx + s > cap.size[0] or ly + s > cap.size[1]:
-                self.miss[k] = time.time()
-                continue
-            icon = key_icon(cap.crop((lx, ly, lx + s, ly + s)), light_theme=(self.cfg.theme == "light"))
-            if icon is None:
-                self.miss[k] = time.time()
-            else:
-                self.cache[k] = icon
-                dbg(f"favicon {k[:24]}")
-        return True
-
-
-# ------------------------------------------------------------------ painting
-class Theme:
-    """Colours for the redrawn bar. 'light' = light active tabs on dark glass (Win7 look)."""
-
-    def __init__(self, light=True):
-        self.light = light
-        if light:
-            self.tab_active_top = (252, 252, 253, 236)
-            self.tab_active_bot = (232, 236, 240, 226)
-            self.tab_fill_top = (255, 255, 255, 46)
-            self.tab_fill_bot = (255, 255, 255, 26)
-            self.tab_hover_top = (255, 255, 255, 96)
-            self.tab_hover_bot = (255, 255, 255, 60)
-            self.tab_edge = (255, 255, 255, 60)
-            self.text_active = (34, 38, 44, 255)
-            self.text_dim = (226, 232, 238, 240)
-            self.close_active = (96, 104, 114, 255)
-            self.close_dim = (226, 232, 238, 210)
-            self.btn_glyph = (246, 249, 252, 255)
-            self.btn_fill_top = (250, 252, 255, 238)
-            self.btn_fill_bot = (222, 228, 236, 230)
-            self.btn_edge = (255, 255, 255, 160)
-            self.plus = (240, 245, 250, 225)
-        else:
-            self.tab_active_top = (74, 82, 94, 232)
-            self.tab_active_bot = (52, 58, 68, 224)
-            self.tab_fill_top = (24, 28, 36, 90)
-            self.tab_fill_bot = (18, 22, 28, 70)
-            self.tab_hover_top = (60, 68, 80, 150)
-            self.tab_hover_bot = (44, 50, 60, 130)
-            self.tab_edge = (255, 255, 255, 40)
-            self.text_active = (250, 252, 255, 255)
-            self.text_dim = (200, 208, 218, 235)
-            self.close_active = (232, 238, 244, 240)
-            self.close_dim = (196, 204, 214, 200)
-            self.btn_glyph = (240, 244, 248, 255)
-            self.btn_fill_top = (255, 255, 255, 40)
-            self.btn_fill_bot = (255, 255, 255, 12)
-            self.btn_edge = (255, 255, 255, 70)
-            self.plus = (226, 232, 240, 190)
-
-
-GLYPH_MIN = [[(0.34, 0.56), (0.66, 0.56)]]
-GLYPH_CHEVRON = [[(0.24, 0.36), (0.5, 0.66), (0.76, 0.36)]]
-GLYPH_MAX = [[(0.34, 0.36), (0.64, 0.36), (0.64, 0.64), (0.34, 0.64), (0.34, 0.36)]]
-GLYPH_CLOSE = [[(0.33, 0.33), (0.67, 0.67)], [(0.67, 0.33), (0.33, 0.67)]]
-GLYPH_PLUS = [[(0.5, 0.32), (0.5, 0.68)], [(0.32, 0.5), (0.68, 0.5)]]
-
-
-def load_font(size):
-    for name in ("segoeui.ttf", "segoeuib.ttf", "arial.ttf"):
-        try:
-            return ImageFont.truetype(os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", name), size)
-        except Exception:
-            continue
-    return ImageFont.load_default()
-
-
-def poly_glyph(draw, rect, polylines, color, width):
-    """Draw one or more polylines scaled into rect."""
-    x0, y0, x1, y1 = rect
-    w, h = x1 - x0, y1 - y0
-    for line in polylines:
-        draw.line([(x0 + px * w, y0 + py * h) for px, py in line],
-                  fill=color, width=width, joint="curve")
-
-
-_GRAD_CACHE = {}
-_MASK_CACHE = {}
-
-
-def _grad_strip(h, top, bot):
-    key = (h, top, bot)
-    g = _GRAD_CACHE.get(key)
-    if g is None:
-        g = Image.new("RGBA", (1, h))
-        gd = ImageDraw.Draw(g)
-        for i in range(h):
-            k = i / max(1, h - 1)
-            gd.point((0, i), fill=tuple(int(top[j] + (bot[j] - top[j]) * k) for j in range(4)))
-        _GRAD_CACHE[key] = g
-    return g
-
-
-def _round_mask(w, h, radius, corners):
-    key = (w, h, radius, corners)
-    m = _MASK_CACHE.get(key)
-    if m is None:
-        m = Image.new("L", (w, h), 0)
-        md = ImageDraw.Draw(m)
-        if radius and corners == "top":
-            md.rounded_rectangle([0, 0, w - 1, h - 1 + radius], radius=radius, fill=255)
-        elif radius:
-            md.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=255)
-        else:
-            md.rectangle([0, 0, w - 1, h - 1], fill=255)
-        _MASK_CACHE[key] = m
-    return m
-
-
-def vgrad(img, box, top, bot, radius=0, corners="all"):
-    """Paint a vertical gradient into box, optionally clipped to rounded corners (cached)."""
-    x0, y0, x1, y1 = (int(v) for v in box)
-    w, h = x1 - x0, y1 - y0
-    if w <= 0 or h <= 0:
-        return
-    grad = _grad_strip(h, top, bot).resize((w, h), Image.Resampling.NEAREST)
-    img.paste(grad, (x0, y0), _round_mask(w, h, radius, corners))
-
-
-def fit_text(font, text, max_w):
-    """Truncate with an ellipsis to max_w px (Pillow's own `length` is ignored with anchor)."""
-    if max_w <= 0:
-        return ""
-    try:
-        if font.getlength(text) <= max_w:
-            return text
-    except Exception:
-        return text
-    ell = "\u2026"
-    lo, hi = 0, len(text)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        try:
-            fits = font.getlength(text[:mid] + ell) <= max_w
-        except Exception:
-            fits = True
-        if fits:
-            lo = mid
-        else:
-            hi = mid - 1
-    return text[:lo] + ell
-
-
-def render(snap, theme, dpi_scale, layout=None, favicons=None, cfg=None, hover=None):
-    """Compose the bar body (NOT premultiplied) plus its hit table.
-
-    layout:   per-tab screen rects from layout_tabs(); None -> the raw UIA rects.
-    favicons: Favicons instance (cache keyed by stable tab title) or None.
-    hover:    ("tab", i) / ("closetab", i) / ("newtab", None) / ("search", None) or None.
-    """
-    wx0, wy0, wx1, wy1 = snap.win
-    band = snap.band
-    W = max(1, wx1 - wx0)
-    H = max(1, band[3] - band[1])
-    img = Image.new("RGBA", (W, H), (0, 0, 0, 1))     # alpha 1: invisible but clickable
-    d = ImageDraw.Draw(img)
-    font = load_font(max(11, int(12 * dpi_scale)))
-    hit = []
-    r_tab = max(4, int((cfg.tab_radius if cfg else 6) * dpi_scale))
-    gap = max(1, int(1 * dpi_scale))
-    inner = max(2, int(7 * dpi_scale))
-    close_w = int(22 * dpi_scale)
-    icon_s = int(16 * dpi_scale)
-    hover_on = bool(cfg.hover) if cfg else True
-    bottom = max(1, int(1 * dpi_scale))
-
-    def local(r):
-        return (r[0] - wx0, r[1] - band[1], r[2] - wx0, r[3] - band[1])
-
-    n = len(snap.tabs)
-    rects = layout if layout and len(layout) == n else [t["rect"] for t in snap.tabs]
-    for i, t in enumerate(snap.tabs):
-        x0, y0, x1, y1 = local(rects[i])
-        box = (x0 + gap, y0, x1 - gap, y1 - bottom)
-        hot = hover_on and hover == ("tab", i) and not t["selected"]
-        if t["selected"]:
-            vgrad(img, box, theme.tab_active_top, theme.tab_active_bot, r_tab, "top")
-        elif hot:
-            vgrad(img, box, theme.tab_hover_top, theme.tab_hover_bot, r_tab, "top")
-        else:
-            vgrad(img, box, theme.tab_fill_top, theme.tab_fill_bot, r_tab, "top")
-        # 1px seam between tabs
-        if i + 1 < n:
-            d.line([(x1 - gap, y0 + r_tab // 2), (x1 - gap, box[3])], fill=theme.tab_edge, width=1)
-        cy = (box[1] + box[3]) // 2 + int(1 * dpi_scale)
-
-        fx = box[0] + inner
-        icon = favicons.cache.get(_stable(t["name"])) if favicons else None
-        if icon is not None:
-            if icon.size != (icon_s, icon_s):
-                icon = icon.resize((icon_s, icon_s), Image.Resampling.LANCZOS)
-            img.paste(icon, (fx, cy - icon_s // 2), icon)
-            tx = fx + icon_s + int(5 * dpi_scale)
-        else:
-            dot = max(3, int(4 * dpi_scale))
-            d.ellipse([fx, cy - dot, fx + 2 * dot, cy + dot],
-                      fill=(120, 180, 235, 235) if t["selected"] else (230, 238, 246, 120))
-            tx = fx + 2 * dot + int(6 * dpi_scale)
-
-        max_w = (box[2] - close_w - int(4 * dpi_scale)) - tx
-        d.text((tx, cy), fit_text(font, t["name"], max_w), font=font, anchor="lm",
-               fill=theme.text_active if t["selected"] else theme.text_dim)
-
-        gx = box[2] - close_w
-        close_hot = hover_on and hover == ("closetab", i)
-        poly_glyph(d, (gx + int(6 * dpi_scale), cy - int(6 * dpi_scale),
-                       gx + close_w - int(6 * dpi_scale), cy + int(6 * dpi_scale)),
-                   GLYPH_CLOSE,
-                   theme.close_active if (t["selected"] or close_hot) else theme.close_dim,
-                   max(1, int(1.1 * dpi_scale)))
-        hit.append((rects[i], ("tab", t)))
-        hit.append(((rects[i][2] - close_w - 2, rects[i][1] + 4,
-                     rects[i][2] - 6, rects[i][3] - 4), ("closetab", t)))
-
-    # tab-search chevron on the left (Chromium draws one; ours is cut away with the strip)
-    if snap.search_r:
-        r = snap.search_r
-        x0, y0, x1, y1 = local(r)
-        if hover_on and hover == ("search", None):
-            vgrad(img, (x0 + gap, y0, x1 - gap, y1 - bottom),
-                  theme.tab_hover_top, theme.tab_hover_bot, r_tab, "top")
-        cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
-        s = int(6 * dpi_scale)
-        poly_glyph(d, (cx - s, cy - s, cx + s, cy + s), GLYPH_CHEVRON,
-                   theme.plus, max(1, int(1.4 * dpi_scale)))
-        hit.append((r, ("search", None)))
-
-    # new tab button: just a plus on the glass
-    if snap.newtab_r:
-        x0, y0, x1, y1 = local(snap.newtab_r)
-        if hover_on and hover == ("newtab", None):
-            vgrad(img, (x0 + gap, y0, x1 - gap, y1 - bottom),
-                  theme.tab_hover_top, theme.tab_hover_bot, r_tab, "top")
-        cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
-        s = int(6 * dpi_scale)
-        poly_glyph(d, (cx - s, cy - s, cx + s, cy + s), GLYPH_PLUS,
-                   theme.plus, max(1, int(1.5 * dpi_scale)))
-        pad = max(2, int(4 * dpi_scale))
-        hit.append(((snap.newtab_r[0] + pad, snap.newtab_r[1] + pad,
-                     snap.newtab_r[2] - pad, snap.newtab_r[3] - pad), ("newtab", None)))
-
-    # window buttons stay native (they live in a child window the region cannot cut), but the
-    # clicks still have to be routed by us.
-    for key, action in (("min_r", "min"), ("max_r", "max"), ("close_r", "close")):
-        r = getattr(snap, key)
-        if r:
-            hit.append((r, (action, None)))
-    return img, hit
-
-
-# ------------------------------------------------------------------ overlay window
-class Overlay:
-    def __init__(self, target, theme, dpi_scale, cfg=None, favicons=None):
-        self.target = target
-        self.theme = theme
-        self.s = dpi_scale
-        self.cfg = cfg or Settings()
-        self.fav = favicons
-        self.hwnd = None
-        self.hit = []
-        self.hover = None
-        self.pending_hover = None      # set by the hook thread, consumed by the paint loop
-        self.layout = []
-        self.newtab_rect = None
-        self.search_rect = None
-        self.band_off = None
-        self.band = None
-        self.dragging = False
-        self.down = (0, 0)
-        self.down_rect = (0, 0, 0, 0)
-        self.last_click = (0.0, (0, 0))
-        self._proc = WNDPROC(self._wndproc)
-
-    def create(self):
-        inst = k32.GetModuleHandleW(None)
-        wc = WNDCLASS()
-        wc.lpfnWndProc = self._proc
-        wc.hInstance = inst
-        wc.lpszClassName = "GlassTitlebarOverlay"
-        wc.hCursor = u32.LoadCursorW(None, 32512)
-        if not u32.RegisterClassW(ctypes.byref(wc)) and ctypes.GetLastError() != 1410:
-            raise ctypes.WinError(ctypes.GetLastError())
-        ex = WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE
-        h = u32.CreateWindowExW(ex, "GlassTitlebarOverlay", "", WS_POPUP,
-                                -20000, -20000, 10, 10, None, None, inst, None)
-        if not h:
-            raise ctypes.WinError(ctypes.GetLastError())
-        self.hwnd = h
-        return h
-
-    # -------------------------------------------------- painting
-    def paint(self, snap, hover=None, force=False):
-        band = snap.band
-        if not band:
-            u32.ShowWindow(self.hwnd, 0)
-            return
-        hover = hover if self.cfg.hover else None
-        layout = layout_tabs(snap, self.s, self.cfg)
-        img, hit = render(snap, self.theme, self.s, layout, self.fav, self.cfg, hover)
-        self.hit = hit
-        self.layout = layout
-        self.hover = hover
-        self.newtab_rect = snap.newtab_r
-        self.search_rect = snap.search_r
-        self.band = band
-        self.band_off = (band[1] - snap.win[1], band[3] - band[1])
-        self._blit(img, band[0], band[1])
-        dbg(f"painted {img.size[0]}x{img.size[1]} at {band[0]},{band[1]} tabs={len(snap.tabs)} "
-            f"layout={layout[:1]} band={band} hover={hover}")
-
-    def freeze(self, box):
-        """Freeze what the band looks like right now as an opaque frame.
-
-        The favicon capture has to clear the window region for ~80 ms. Without this the
-        browser's own dark tab strip would show through the semi-transparent parts of our
-        bar for a few frames; with it the user sees no change at all.
-        """
-        try:
-            shot = _screen_grab(box).convert("RGBA")
-        except Exception as e:
-            dbg(f"freeze failed {e!r}")
-            return
-        self._blit(shot, box[0], box[1])
-
-    def _blit(self, img, x, y):
-        w, h = img.size
-        a = img.getchannel("A")
-        pre = ImageChops.multiply(img.convert("RGB"), a.convert("RGB"))
-        flat = Image.merge("RGBA", (*pre.split(), a))
-        screen = u32.GetDC(None)
-        mem = gdi.CreateCompatibleDC(screen)
-        bmi = BITMAPINFO()
-        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.bmiHeader.biWidth = w
-        bmi.bmiHeader.biHeight = -h            # top-down
-        bmi.bmiHeader.biPlanes = 1
-        bmi.bmiHeader.biBitCount = 32
-        bmi.bmiHeader.biCompression = 0        # BI_RGB
-        bits = ctypes.c_void_p()
-        hbmp = gdi.CreateDIBSection(mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
-        old = gdi.SelectObject(mem, hbmp)
-        data = flat.tobytes("raw", "BGRA")
-        ctypes.memmove(bits, data, len(data))
-        blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
-        dst = POINT(x, y)
-        size = SIZE(w, h)
-        src = POINT(0, 0)
-        ok = u32.UpdateLayeredWindow(self.hwnd, screen, ctypes.byref(dst), ctypes.byref(size),
-                                     mem, ctypes.byref(src), 0, ctypes.byref(blend), ULW_ALPHA)
-        gdi.SelectObject(mem, old)
-        gdi.DeleteObject(hbmp)
-        gdi.DeleteDC(mem)
-        u32.ReleaseDC(None, screen)
-        u32.SetWindowPos(self.hwnd, 0, x, y, w, h, SWP_NOACTIVATE)
-        u32.ShowWindow(self.hwnd, 4)
-        self.raise_above()
-        if DEBUG:
-            rr = RECT()
-            u32.GetWindowRect(self.hwnd, ctypes.byref(rr))
-            dbg(f"winrect now {(rr.left, rr.top, rr.right, rr.bottom)}")
-        if os.environ.get("GLASS_TITLEBAR_DUMP") == "1":
-            try:
-                img.save(os.path.join(os.environ.get("TEMP", "."), "gt_last.png"))
-            except Exception:
-                pass
-        return ok
-
-    def hover_at(self, x, y):
-        """Which drawn control is under the cursor (cheap: a handful of rects)."""
-        for i, r in enumerate(self.layout):
-            if r[0] <= x < r[2] and r[1] <= y < r[3]:
-                if x >= r[2] - int(22 * self.s) - 2:
-                    return ("closetab", i)
-                return ("tab", i)
-        for r, action in ((self.newtab_rect, ("newtab", None)),
-                          (self.search_rect, ("search", None))):
-            if r and r[0] <= x < r[2] and r[1] <= y < r[3]:
-                return action
-        return None
-
-    # -------------------------------------------------- input
-    def raise_above(self):
-        """Keep the overlay directly above the browser window in the Z order."""
-        if not self.hwnd or not self.target:
-            return
-        prev = u32.GetWindow(self.target, 3)      # GW_HWNDPREV
-        if prev == self.hwnd:
-            return
-        u32.SetWindowPos(self.hwnd, prev or 0, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-
-    def hit_test(self, x, y):
-        for rect, action in reversed(self.hit):
-            if rect[0] <= x < rect[2] and rect[1] <= y < rect[3]:
-                return action
-        return None
-
-    def _wndproc(self, h, msg, wp, lp):
-        t = self.target
-        if msg == 0x0084:                      # WM_NCHITTEST
-            return 1
-        if msg == 0x0021:                      # WM_MOUSEACTIVATE
-            return MA_NOACTIVATE
-        if msg == 0x0201:                      # WM_LBUTTONDOWN
-            x = ctypes.c_short(lp & 0xFFFF).value
-            y = ctypes.c_short((lp >> 16) & 0xFFFF).value
-            p = POINT(x, y)
-            u32.ClientToScreen(h, ctypes.byref(p))
-            action = self.hit_test(p.x, p.y)
-            dbg(f"click {p.x},{p.y} -> {action[0] if action else 'background'}")
-            if action:
-                kind, tab = action
-                if kind == "tab":
-                    self._select_tab(tab)
-                elif kind == "closetab":
-                    self._close_tab(tab)
-                elif kind == "newtab":
-                    self._send_key(t, 0x11, 0x54)      # Ctrl+T
-                elif kind == "search":
-                    self._send_key(t, (0x11, 0x10), 0x41)   # Ctrl+Shift+A
-                elif kind in ("min", "max", "close"):
-                    self._window_button(kind)
-                return 1
-            # background: drag the window
-            if u32.GetWindowLongW(t, GWL_STYLE) & WS_MAXIMIZE:
-                return 1
-            self.dragging = True
-            self.down = (p.x, p.y)
-            self.down_rect = window_rect(t)
-            return 1
-        if msg == 0x0200 and self.dragging:              # WM_MOUSEMOVE
-            p = POINT()
-            u32.GetCursorPos(ctypes.byref(p))
-            dx, dy = p.x - self.down[0], p.y - self.down[1]
-            x0, y0, x1, y1 = self.down_rect
-            u32.SetWindowPos(t, 0, x0 + dx, y0 + dy, x1 - x0, y1 - y0,
-                             SWP_NOZORDER | SWP_NOACTIVATE)
-            return 1
-        if msg == 0x0202:                                # WM_LBUTTONUP
-            if self.dragging:
-                self.dragging = False
-                p = POINT()
-                u32.GetCursorPos(ctypes.byref(p))
-                moved = abs(p.x - self.down[0]) + abs(p.y - self.down[1])
-                if moved <= 3:
-                    now = time.time()
-                    lt, lp_ = self.last_click
-                    if now - lt <= u32.GetDoubleClickTime() / 1000 and \
-                            abs(p.x - lp_[0]) <= 4 and abs(p.y - lp_[1]) <= 4:
-                        if u32.GetWindowLongW(t, GWL_STYLE) & WS_MAXIMIZE:
-                            u32.ShowWindow(t, SW_RESTORE)
-                        else:
-                            u32.ShowWindow(t, SW_MAXIMIZE)
-                        self.last_click = (0.0, (0, 0))
-                        dbg("dblclick maximize")
-                    else:
-                        self.last_click = (now, (p.x, p.y))
-                return 1
-        return u32.DefWindowProcW(h, msg, wp, lp)
-
-    # -------------------------------------------------- actions
-    @staticmethod
-    def _select_tab(tab):
-        try:
-            p = tab["el"].GetCurrentPattern(SEL)
-            p.QueryInterface(UIA.IUIAutomationSelectionItemPattern).Select()
-            dbg(f"select {tab['name'][:20]}")
-        except Exception as e:
-            dbg(f"select failed {e!r}")
-
-    @staticmethod
-    def _close_tab(tab):
-        try:
-            el = tab.get("close_el")
-            if el:
-                el.GetCurrentPattern(INV).QueryInterface(UIA.IUIAutomationInvokePattern).Invoke()
-                dbg(f"close {tab['name'][:20]}")
-        except Exception as e:
-            dbg(f"close failed {e!r}")
-
-    def _window_button(self, kind):
-        t = self.target
-        if not t:
-            return
-        if kind == "min":
-            u32.PostMessageW(t, WM_SYSCOMMAND, SC_MINIMIZE, 0)
-        elif kind == "max":
-            if u32.GetWindowLongW(t, GWL_STYLE) & WS_MAXIMIZE:
-                u32.PostMessageW(t, WM_SYSCOMMAND, SC_RESTORE, 0)
-            else:
-                u32.PostMessageW(t, WM_SYSCOMMAND, SC_MAXIMIZE, 0)
-        else:
-            u32.PostMessageW(t, WM_SYSCOMMAND, SC_CLOSE, 0)
-        dbg(f"window button {kind}")
-
-    @staticmethod
-    def _send_key(t, mod, key):
-        """mod may be a single VK or a tuple/list of them (all held for the key press)."""
-        mods = list(mod) if isinstance(mod, (tuple, list)) else [mod]
-        u32.SetForegroundWindow(t)
-        time.sleep(0.02)
-        dbg(f"sendkey mods={mods} key={key:#x} fg={u32.GetForegroundWindow():#x} target={t:#x}")
-        for m in mods:
-            u32.keybd_event(m, 0, 0, 0)
-        u32.keybd_event(key, 0, 0, 0)
-        u32.keybd_event(key, 0, 2, 0)
-        for m in reversed(mods):
-            u32.keybd_event(m, 0, 2, 0)
-
-
-# ------------------------------------------------------------------ input hook
-def force_foreground(h):
-    """SetForegroundWindow from a background process needs a thread-input attach."""
-    if not h or not u32.IsWindow(h):
-        return
-    if u32.GetForegroundWindow() == h:
-        return
-    fg = u32.GetForegroundWindow()
-    me = k32.GetCurrentThreadId()
-    other = u32.GetWindowThreadProcessId(fg, None) if fg else 0
-    attached = False
-    if other and other != me:
-        attached = bool(u32.AttachThreadInput(me, other, True))
-    try:
-        u32.BringWindowToTop(h)
-        u32.SetForegroundWindow(h)
-        u32.SetFocus(h)
-    finally:
-        if attached:
-            u32.AttachThreadInput(me, other, False)
-
-
-class InputHook:
-    """Low-level mouse hook for the bar area.
-
-    A layered window with alpha~0 is click-through (DWM hit-tests per pixel), so the overlay
-    cannot receive the clicks itself. The hook swallows every click inside the bar and routes
-    it to the overlay's hit map, which also keeps the desktop from seeing those clicks.
-    """
-
-    def __init__(self, target, overlay):
-        self.target = target
-        self.overlay = overlay
-        self.band = None
-        self.lock = threading.Lock()
-        self.hook = None
-        self.q = queue.Queue()
-        self.stop_flag = False
-        self.active = False
-        self.tid = 0
-        self.last_event_ts = 0.0
-        self.dragging = False
-        self.down_pt = (0, 0)
-        self.down_rect = (0, 0, 0, 0)
-        self.hover = None
-        self.hover_rect = None
-        self.last_click = (0.0, (0, 0))
-        self._proc = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wt.WPARAM, wt.LPARAM)(self._hook)
-
-    def _drag_loop(self):
-        """SetCursorPos-driven (injected) moves never reach a LL hook, so poll instead."""
-        while not self.stop_flag:
-            if self.dragging:
-                p = POINT()
-                u32.GetCursorPos(ctypes.byref(p))
-                dx, dy = p.x - self.down_pt[0], p.y - self.down_pt[1]
-                x0, y0, x1, y1 = self.down_rect
-                u32.SetWindowPos(self.target, 0, x0 + dx, y0 + dy, x1 - x0, y1 - y0,
-                                 SWP_NOZORDER | SWP_NOACTIVATE)
-            time.sleep(0.012)
-
-    def _drain(self):
-        """UIA calls must not run inside a low-level hook (Windows drops slow hooks)."""
-        while True:
-            item = self.q.get()
-            if item is None:
-                return
-            kind, tab = item
-            try:
-                if kind == "activate":
-                    force_foreground(self.target)
-                elif kind == "tab":
-                    self.overlay._select_tab(tab)
-                elif kind == "closetab":
-                    self.overlay._close_tab(tab)
-                elif kind == "newtab":
-                    self.overlay._send_key(self.target, 0x11, 0x54)
-                elif kind == "search":
-                    self.overlay._send_key(self.target, (0x11, 0x10), 0x41)   # Ctrl+Shift+A
-                elif kind == "nexttabs":
-                    self.overlay._send_key(self.target, 0x11, 0x09)           # Ctrl+Tab
-                elif kind == "prevtabs":
-                    self.overlay._send_key(self.target, (0x11, 0x10), 0x09)   # Ctrl+Shift+Tab
-                elif kind in ("min", "max", "close"):
-                    self.overlay._window_button(kind)
-            except Exception as e:
-                dbg(f"action error {e!r}")
-
-    def set_band(self, band):
-        with self.lock:
-            self.active = band is not None
-            self.hover_rect = band
-
-    def _hover_track(self, x, y):
-        """Cheap hover bookkeeping. Runs inside the LL hook, so: no UIA, no drawing, no paint
-        -- it only records the target and lets the main loop repaint."""
-        hb = self.hover_rect
-        if hb and hb[0] <= x < hb[2] and hb[1] <= y < hb[3]:
-            hv = self.overlay.hover_at(x, y)
-        else:
-            hv = None
-        if hv != self.hover:
-            self.hover = hv
-            self.overlay.pending_hover = hv
-
-    def in_band(self, x, y):
-        """Live geometry: the cached band goes stale the moment the window moves."""
-        if not self.active:
-            return False
-        t = self.target
-        off = self.overlay.band_off
-        if not t or not off or not u32.IsWindow(t):
-            return False
-        r = window_rect(t)
-        y0 = r[1] + off[0]
-        y1 = y0 + off[1]
-        pad = 2
-        return r[0] <= x < r[2] and (y0 - pad) <= y < (y1 + pad)
-
-    def _hook(self, code, wparam, lparam):
-        self.last_event_ts = time.time()
-        if code < 0:
-            return u32.CallNextHookEx(None, code, wparam, lparam)
-        try:
-            info = ctypes.cast(lparam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-            if info.flags & LLMHF_INJECTED and os.environ.get("GLASS_TITLEBAR_IGNORE_INJECTED") == "1":
-                return u32.CallNextHookEx(None, code, wparam, lparam)
-            x, y = info.pt.x, info.pt.y
-            msg = wparam & 0xFFFFFFFF
-            t = self.target
-
-            # Mouse moves are by far the most frequent event: handle the drag case, keep hover
-            # cheap, and get out.
-            if msg == WM_MOUSEMOVE:
-                if self.dragging:
-                    dx, dy = x - self.down_pt[0], y - self.down_pt[1]
-                    x0, y0, x1, y1 = self.down_rect
-                    u32.SetWindowPos(t, 0, x0 + dx, y0 + dy, x1 - x0, y1 - y0,
-                                     SWP_NOZORDER | SWP_NOACTIVATE)
-                    return 1
-                try:
-                    self._hover_track(x, y)
-                except Exception:
-                    pass
-                return u32.CallNextHookEx(None, code, wparam, lparam)
-
-            live = bool(t) and u32.IsWindow(t)
-            if live:
-                p = POINT(x, y)
-                under = u32.WindowFromPoint(p)
-                root = u32.GetAncestor(under, 2) if under else 0
-                live = root == t or root == u32.GetDesktopWindow() or root == self.overlay.hwnd
-            if not live:
-                return u32.CallNextHookEx(None, code, wparam, lparam)
-
-            if msg == WM_LBUTTONDOWN:
-                if not self.in_band(x, y):
-                    return u32.CallNextHookEx(None, code, wparam, lparam)
-                if u32.GetForegroundWindow() != t:
-                    self.q.put(("activate", None))     # never block the hook on SetForegroundWindow
-                action = self.overlay.hit_test(x, y)
-                dbg(f"click {x},{y} -> {action[0] if action else 'background'}")
-                if action:
-                    # Nothing that can block (UIA, SetForegroundWindow, keybd_event) may run
-                    # in a low-level hook: it gets skipped or silently uninstalled when slow.
-                    self.q.put(action)
-                    return 1
-                if u32.GetWindowLongW(t, GWL_STYLE) & WS_MAXIMIZE:
-                    return 1
-                self.dragging = True
-                self.down_pt = (x, y)
-                self.down_rect = window_rect(t)
-                dbg(f"drag start {x},{y} rect={self.down_rect}")
-                if u32.GetForegroundWindow() != t:
-                    self.q.put(("activate", None))
-                return 1
-
-            if msg == WM_LBUTTONUP:
-                if self.dragging:
-                    self.dragging = False
-                    moved = abs(x - self.down_pt[0]) + abs(y - self.down_pt[1])
-                    dbg(f"drag end moved={moved}")
-                    if moved <= 3:
-                        now = time.time()
-                        lt, lp_ = self.last_click
-                        if (now - lt) <= u32.GetDoubleClickTime() / 1000.0 and \
-                                abs(x - lp_[0]) <= 4 and abs(y - lp_[1]) <= 4:
-                            if u32.GetWindowLongW(t, GWL_STYLE) & WS_MAXIMIZE:
-                                u32.ShowWindow(t, SW_RESTORE)
-                            else:
-                                u32.ShowWindow(t, SW_MAXIMIZE)
-                            self.q.put(("activate", None))
-                            self.last_click = (0.0, (0, 0))
-                            dbg("double click -> toggle maximize")
-                        else:
-                            self.last_click = (now, (x, y))
-                    return 1
-                if self.in_band(x, y):
-                    return 1                                     # a click on a drawn control
-
-            if msg == WM_MOUSEWHEEL and self.in_band(x, y):
-                if self.overlay.cfg.wheel_tabs:
-                    up = ctypes.c_short((info.mouseData >> 16) & 0xFFFF).value > 0
-                    dbg(f"wheel {'up' if up else 'down'} at {x},{y} -> {'prevtabs' if up else 'nexttabs'}")
-                    self.q.put(("prevtabs" if up else "nexttabs", None))
-                    return 1
-                return u32.CallNextHookEx(None, code, wparam, lparam)
-
-            if msg in (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP) and self.in_band(x, y):
-                dbg(f"swallowed button msg {msg}")
-                return 1
-        except Exception as e:
-            dbg(f"hook error {e!r}")
-        return u32.CallNextHookEx(None, code, wparam, lparam)
-
-    def start(self):
-        threading.Thread(target=self._drain, daemon=True).start()
-        threading.Thread(target=self._drag_loop, daemon=True).start()
-        threading.Thread(target=self._watch, daemon=True).start()
-        threading.Thread(target=self._run, daemon=True).start()
-
-    def _watch(self):
-        """Windows silently drops low-level hooks that time out.
-
-        The cursor keeps moving but no events arrive any more, which looks exactly like
-        'clicks pass through the title bar'. Detect it and reinstall the hook.
-        """
-        last_pos = None
-        while not self.stop_flag:
-            time.sleep(0.7)
-            p = POINT()
-            u32.GetCursorPos(ctypes.byref(p))
-            pos = (p.x, p.y)
-            moved = last_pos is not None and pos != last_pos
-            last_pos = pos
-            if moved and (time.time() - self.last_event_ts) > 1.2 and self.tid:
-                dbg("hook stopped delivering, reinstalling")
-                u32.PostThreadMessageW(self.tid, WM_APP + 1, 0, 0)
-
-    def _install(self):
-        self.hook = u32.SetWindowsHookExW(WH_MOUSE_LL, ctypes.cast(self._proc, ctypes.c_void_p),
-                                         k32.GetModuleHandleW(None), 0)
-        self.tid = k32.GetCurrentThreadId()
-        self.last_event_ts = time.time()
-        dbg(f"input hook {self.hook}")
-        return self.hook
-
-    def _run(self):
-        k32.SetThreadPriority(k32.GetCurrentThread(), 2)     # THREAD_PRIORITY_HIGHEST
-        u32.SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p, wt.HMODULE, wt.DWORD]
-        u32.SetWindowsHookExW.restype = wt.HHOOK
-        u32.CallNextHookEx.argtypes = [wt.HANDLE, ctypes.c_int, wt.WPARAM, wt.LPARAM]
-        u32.CallNextHookEx.restype = ctypes.c_ssize_t
-        k32.GetModuleHandleW.restype = wt.HMODULE
-        if not self._install():
-            print("SetWindowsHookExW failed", ctypes.GetLastError(), flush=True)
-            return
-        msg = wt.MSG()
-        while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == WM_APP + 1:
-                if self.hook:
-                    u32.UnhookWindowsHookEx(self.hook)
-                if not self._install():
-                    print("hook reinstall failed", ctypes.GetLastError(), flush=True)
-                continue
-            u32.TranslateMessage(ctypes.byref(msg))
-            u32.DispatchMessageW(ctypes.byref(msg))
-
-    def stop(self):
-        self.stop_flag = True
-        if self.hook:
-            u32.UnhookWindowsHookEx(self.hook)
-            self.hook = None
-
-
-class CaptionHook(threading.Thread):
-    """Block mouse input in the OpenGlass caption corner.
-
-    That corner is a region *hole* (so OpenGlass paints its Win7 buttons there), which means
-    Windows routes input to whatever is behind the browser. The low-level hook swallows it
-    before it can activate the desktop, the browser, or a caption command.
+# ------------------------------------------------------------ touch overlay input
+class TouchOverlay(threading.Thread):
+    """Invisible layered window that owns the OpenGlass caption corner's input.
+
+    The caption corner is a region *hole* (OpenGlass paints its Win7 capsules there), so input
+    in that area falls through to whatever sits behind the browser. The old answer was a global
+    WH_MOUSE_LL hook, whose callbacks Windows silently unloads when they run long, which needs
+    a watchdog, and which breaks under two daemon copies (one eats the other's LBUTTONUP).
+
+    Instead this overlays an invisible (alpha=1) layered window on exactly the hole. Its own
+    WndProc receives the mouse messages and drives the browser directly:
+      * on a capsule  -> WM_SYSCOMMAND (SC_MINIMIZE / SC_MAXIMIZE|SC_RESTORE / SC_CLOSE)
+      * on empty caption -> drag the window; a double-click toggles maximise
+      * any click in the hole -> bring the window to the foreground first
+    The capsule rects come from win7_caption_buttons() -- the *drawn* Win7 metrics, never
+    Chromium's UIA button rects -- so a click on the drawn `-` never fires the native `□`
+    (FINDINGS 11.12/11.13). The overlay rect is the exact hole rect, so hole, hit table and
+    input surface all share one source of geometry.
+
+    Only the TOP caption corner is handled here: the four-side resize borders are out of scope
+    for now (a separate overlay can cover those later).
     """
 
     SC = {"min": 0xF020, "max": 0xF030, "restore": 0xF120, "close": 0xF060}
 
     def __init__(self, target):
-        super().__init__(daemon=True, name="caption-hook")
+        super().__init__(daemon=True, name="touch-overlay")
         self.target = target
-        self.area = None            # the holed corner, screen coords
-        self.buttons = {}           # name -> rect (the *drawn* Win7 capsules)
-        self.native = ()            # Chromium's own caption-button rects (never to be used)
-        self.pending = None
+        self.area = None            # screen rect of the holed corner
+        self.buttons = {}           # name -> rect (the Win7 capsules OpenGlass paints)
+        self.hwnd = None
+        self.moving = None          # (start window rect, grab point in screen coords)
+        self.restore_drag = None    # (x0, y0, start rect, grab ratio) while maximised
         self.down = False
-        self.resizing = None
-        self.moving = None
-        self.restore_drag = None
-        self.native_mode = False
-        self._mv = 0
-        self._mm = 0
-        self.drag_t0 = 0.0
+        self.pending = None         # capsule name hit on button-down
         self.last_click = (0.0, (0, 0))
-        self.frame_win = None
-        self.frame_n = 0
-        self.lock = threading.Lock()
+        self.drag_t0 = 0.0
         self.stop_flag = False
-        self.hook = None
-        self.tid = None
-        self._proc = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wt.WPARAM, wt.LPARAM)(
-            self._hook)
+        self.lock = threading.Lock()
         self.q = queue.Queue()
-        self.last_event_ts = time.time()
-        threading.Thread(target=self._worker, daemon=True, name="caption-worker").start()
-
-    def _worker(self):
-        """Foreground activation must not run inside the LL hook: AttachThreadInput /
-        SetForegroundWindow can block for hundreds of ms and the system silently unhooks a
-        slow low-level hook (that was why selecting/resizing worked only sometimes)."""
-        while not self.stop_flag:
-            try:
-                kind, _ = self.q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            try:
-                if kind == "fg":
-                    force_foreground(self.target)
-            except Exception as e:
-                dbg(f"caption worker error {e!r}")
-
-    def _ask_fg(self):
-        self.q.put(("fg", None))
-
-    def set_area(self, area, buttons, native=None):
-        with self.lock:
-            self.area = area
-            self.buttons = {k: v for k, v in buttons.items() if v}
-            self.native = tuple(r for r in (native or ()) if r)
-
-    def set_frame(self, win, n):
-        """Geometry of the four thin hole strips, so clicks there can resize/activate."""
-        with self.lock:
-            self.frame_win = win
-            self.frame_n = n
-
-    def _edge(self, x, y):
-        w, n = self.frame_win, self.frame_n
-        if not w or not n or not (w[0] <= x < w[2] and w[1] <= y < w[3]):
-            return None
-        top, bot = y < w[1] + n, y >= w[3] - n
-        left, right = x < w[0] + n, x >= w[2] - n
-        if not (top or bot or left or right):
-            return None
-        if top and left:
-            return "tl"
-        if top and right:
-            return "tr"
-        if bot and left:
-            return "bl"
-        if bot and right:
-            return "br"
-        return "t" if top else "b" if bot else "l" if left else "r"
+        self._proc = WNDPROC(self._wndproc)
+        # 64-bit handles: without argtypes ctypes passes Python ints as 32-bit c_int and
+        # truncates the HWND. Set these here (types match gt_daemon._setup_win32 so they do
+        # not fight over a shared process). RegisterClassW / GetCursorPos stay untyped: they
+        # take a custom WNDCLASS / POINT struct that differs between modules (FINDINGS 10.1).
+        u32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                        wt.HWND, wt.HMENU, wt.HINSTANCE, ctypes.c_void_p]
+        u32.CreateWindowExW.restype = wt.HWND
+        u32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+        u32.GetWindow.restype = wt.HWND
+        u32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
+                                     ctypes.c_int, ctypes.c_int, wt.UINT]
+        u32.SetWindowPos.restype = wt.BOOL
+        u32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+        u32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+        u32.PostMessageW.restype = wt.BOOL
+        u32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+        u32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
+        u32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
+        u32.DispatchMessageW.restype = ctypes.c_ssize_t
+        u32.SetCapture.argtypes = [wt.HWND]
+        u32.ReleaseCapture.argtypes = []
+        u32.GetDoubleClickTime.restype = wt.UINT
+        threading.Thread(target=self._worker, daemon=True, name="touch-worker").start()
 
     @property
     def busy(self):
-        """True while a hand move/resize started by this hook is in flight."""
-        return bool(self.native_mode or self.moving or self.resizing or self.restore_drag)
+        """True while a hand move started by this overlay is in flight."""
+        return bool(self.moving or self.restore_drag)
+
+    # -------------------------------------------------- foreground activation
+    def _worker(self):
+        """SetForegroundWindow / AttachThreadInput can block for hundreds of ms; run them off
+        the message-loop thread (a slow LL hook callback got silently dropped -- same applies)."""
+        while not self.stop_flag:
+            try:
+                self.q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                force_foreground(self.target)
+            except Exception as e:
+                dbg(f"touch worker error {e!r}")
+
+    def _ask_fg(self):
+        self.q.put(1)
+
+    # -------------------------------------------------- geometry
+    def set_area(self, area, buttons):
+        """Move/resize the overlay to cover `area` (the hole) and record the capsule rects."""
+        with self.lock:
+            self.area = area
+            self.buttons = {k: v for k, v in buttons.items() if v}
+        self._reposition()
+
+    def clear(self):
+        self.set_area(None, {})
 
     def _hit(self, x, y):
         a = self.area
@@ -1634,287 +607,204 @@ class CaptionHook(threading.Thread):
                 return name
         return None
 
-    def _capsule_x(self, x):
-        """Capsule name whose horizontal span contains `x` (vertical extent ignored)."""
-        for name, r in self.buttons.items():
-            if r[0] <= x < r[2]:
-                return name
-        return None
+    # -------------------------------------------------- window plumbing
+    def _reposition(self):
+        if not self.hwnd:
+            return
+        a = self.area
+        if not a:
+            u32.ShowWindow(self.hwnd, 0)
+            return
+        x, y, x1, y1 = a
+        w, h = x1 - x, y1 - y
+        if w <= 0 or h <= 0:
+            u32.ShowWindow(self.hwnd, 0)
+            return
+        # Per-pixel alpha of 1 is invisible to the eye but NOT transparent to DWM hit-testing
+        # (only alpha 0 lets the mouse through), so the whole window stays clickable.
+        screen = u32.GetDC(None)
+        mem = gdi.CreateCompatibleDC(screen)
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = w
+        bmi.bmiHeader.biHeight = -h
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bits = ctypes.c_void_p()
+        hbmp = gdi.CreateDIBSection(mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+        old = gdi.SelectObject(mem, hbmp)
+        ctypes.memset(bits, 1, w * h * 4)       # BGRA, every byte 1 -> alpha 1 everywhere
+        blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
+        dst = POINT(x, y)
+        size = SIZE(w, h)
+        src = POINT(0, 0)
+        u32.UpdateLayeredWindow(self.hwnd, screen, ctypes.byref(dst), ctypes.byref(size),
+                                mem, ctypes.byref(src), 0, ctypes.byref(blend), ULW_ALPHA)
+        gdi.SelectObject(mem, old)
+        gdi.DeleteObject(hbmp)
+        gdi.DeleteDC(mem)
+        u32.ReleaseDC(None, screen)
+        u32.SetWindowPos(self.hwnd, 0, x, y, w, h, SWP_NOACTIVATE)
+        u32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
+        self._raise_above()
 
-    def _native_button(self, x, y):
-        """True when (x, y) sits on one of Chromium's own caption buttons."""
-        for r in self.native:
-            if r[0] <= x < r[2] and r[1] <= y < r[3]:
-                return True
-        return False
+    def _raise_above(self):
+        """Keep the overlay directly above the browser window (it must win the hit test)."""
+        prev = u32.GetWindow(self.target, 3)      # GW_HWNDPREV
+        if prev == self.hwnd:
+            return
+        u32.SetWindowPos(self.hwnd, prev or 0, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
 
-    def _hook(self, code, wparam, lparam):
-        self.last_event_ts = time.time()
-        if code < 0:
-            return u32.CallNextHookEx(None, code, wparam, lparam)
+    # -------------------------------------------------- mouse handling
+    def _wndproc(self, h, msg, wp, lp):
+        if msg == WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE
         try:
-            info = ctypes.cast(lparam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-            msg = wparam & 0xFFFFFFFF
-            x, y = info.pt.x, info.pt.y
-            if self.native_mode:
-                # Windows owns the drag now (modal move/resize loop): every event must reach
-                # it untouched, otherwise the loop sees no movement and snaps back.
-                if msg == WM_LBUTTONUP:
-                    self.native_mode = False
-                    self.down = False
-                    self.pending = None
-                return u32.CallNextHookEx(None, code, wparam, lparam)
-            a = self.area
-            inside = bool(a) and a[0] <= x < a[2] and a[1] <= y < a[3]
-            if inside:
-                self.moving = None
-                self.resizing = None
-                self.restore_drag = None
-                self.pending = None
-                self.down = False
-                return 1
-            if msg == WM_MOUSEMOVE and (self.moving or self.resizing or self.restore_drag) \
-                    and not (u32.GetAsyncKeyState(0x01) & 0x8000):
-                self.moving = None
-                self.resizing = None
-                self.restore_drag = None
-                self.down = False
-                self.pending = None
-                trace("stale drag cleared: left button is up")
-                return u32.CallNextHookEx(None, code, wparam, lparam)
-            if (self.moving or self.resizing) and msg in (WM_LBUTTONDOWN, WM_MOUSEMOVE):
-                # A latch must never survive a button-up it never saw (a second hook copy or
-                # another app swallowing the click): the window then "snaps back" on every
-                # mouse move. A fresh press, or a drag older than 20 s, clears it.
-                if msg == WM_LBUTTONDOWN or (time.time() - self.drag_t0) > 20:
-                    self.moving = None
-                    self.resizing = None
-                    self.restore_drag = None
-                    self.down = False
-                    self.pending = None
-            if msg == WM_LBUTTONDOWN:
-                trace(f"down {x},{y} inside={inside} area={a} frame={self.frame_win} n={self.frame_n}")
-                # The frame strips win over the caption: the top border overlaps the caption
-                # band, and treating it as caption made the top edge impossible to resize.
-                edge = None if u32.IsZoomed(self.target) else self._edge(x, y)
-                if edge:
-                    self.resizing = (edge, window_rect(self.target), (x, y))
-                    self.drag_t0 = time.time()
-                    self.down = True
-                    self._ask_fg()
-                    trace(f"resize start {edge}")
-                    return 1
-                if inside:
-                    hit = self._hit(x, y)
-                    self.pending = hit
-                    self.down = True
-                    trace(f"hit={self.pending} zoomed={u32.IsZoomed(self.target)}")
-                    self._ask_fg()
-                    if not hit:
-                        if u32.IsZoomed(self.target):
-                            # Windows behaviour: dragging a maximised window's caption
-                            # restores it and keeps the grab point under the cursor.
-                            mr = window_rect(self.target)
-                            self.restore_drag = (x, y, mr, (x - mr[0]) / max(1, mr[2] - mr[0]))
-                        else:
-                            self.moving = (window_rect(self.target), (x, y))
-                        self.drag_t0 = time.time()
-                    return 1            # never let it reach the desktop behind the hole
-                elif self._native_button(x, y):
-                    # A Chromium caption-button pixel that the hole does not cover at this
-                    # instant (the first frame after an attach or a resume, a band that has not
-                    # stabilised yet). The native buttons are invisible there, so letting one
-                    # of them fire is always wrong: route the click to the capsule drawn at the
-                    # same x, i.e. behave exactly as if the hole were already up.
-                    self.pending = self._capsule_x(x)
-                    self.down = True
-                    self.drag_t0 = time.time()
-                    self._ask_fg()
-                    trace(f"native button blocked ({x},{y}) -> {self.pending}")
-                    return 1
-            elif msg == WM_MOUSEMOVE and self.restore_drag:
+            if msg in (WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_LBUTTONUP):
+                p = POINT()
+                u32.GetCursorPos(ctypes.byref(p))
+                return self._mouse(msg, p.x, p.y)
+            if msg in (WM_RBUTTONDOWN, WM_MBUTTONDOWN):
+                return 0               # swallow right/middle clicks in the hole
+        except Exception as e:
+            dbg(f"touch wndproc error {e!r}")
+        return u32.DefWindowProcW(h, msg, wp, lp)
+
+    def _mouse(self, msg, x, y):
+        if msg == WM_LBUTTONDOWN:
+            self._ask_fg()
+            u32.SetCapture(self.hwnd)      # keep the drag alive when the cursor leaves the hole
+            self.down = True
+            self.drag_t0 = time.time()
+            self.pending = self._hit(x, y)
+            trace(f"touch down {x},{y} hit={self.pending}")
+            if not self.pending:
+                if u32.IsZoomed(self.target):
+                    mr = window_rect(self.target)
+                    self.restore_drag = (x, y, mr, (x - mr[0]) / max(1, mr[2] - mr[0]))
+                else:
+                    self.moving = (window_rect(self.target), (x, y))
+            return 0
+        if msg == WM_MOUSEMOVE:
+            if self.restore_drag:
                 x0, y0, mr, ratio = self.restore_drag
                 if abs(x - x0) + abs(y - y0) > 8:
                     self.restore_drag = None
                     u32.ShowWindow(self.target, 9)          # SW_RESTORE
                     nr = window_rect(self.target)
                     nw = max(1, nr[2] - nr[0])
-                    left = x - int(ratio * nw)
-                    u32.SetWindowPos(self.target, 0, left, nr[1], 0, 0,
+                    u32.SetWindowPos(self.target, 0, x - int(ratio * nw), nr[1], 0, 0,
                                      SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
                     self.moving = (window_rect(self.target), (x, y))
-                    self.drag_t0 = time.time()
-                    trace(f"restore-drag from maximized -> {self.moving[0]}")
-                return 1
-            elif msg == WM_MOUSEMOVE and self.moving:
+                    trace(f"touch restore-drag -> {self.moving[0]}")
+            elif self.moving:
                 r0, (sx, sy) = self.moving
-                self._mv += 1
-                if self._mv <= 2:
-                    dbg(f"mv gask={u32.GetAsyncKeyState(0x01):#010x} mv={self._mv}")
-                if self._mv % 10 == 1:
-                    trace(f"drag {x},{y} -> {r0[0] + (x - sx)},{r0[1] + (y - sy)}")
                 u32.SetWindowPos(self.target, 0, r0[0] + (x - sx), r0[1] + (y - sy), 0, 0,
                                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
-                return 1
-            elif msg == WM_MOUSEMOVE and self.resizing:
-                edge, r0, (sx, sy) = self.resizing
-                l, t, r, b = r0
-                dx, dy = x - sx, y - sy
-                sc = (u32.GetDpiForWindow(self.target) or 96) / 96.0
-                minw = max(480, int(500 * sc))      # Chromium refuses to go below 500 DIP
-                minh = max(320, int(200 * sc))
-                if "l" in edge:
-                    l = min(l + dx, r - minw)
-                if "r" in edge:
-                    r = max(r + dx, l + minw)
-                if "t" in edge:
-                    t = min(t + dy, b - minh)
-                if "b" in edge:
-                    b = max(b + dy, t + minh)
-                u32.SetWindowPos(self.target, 0, l, t, r - l, b - t,
-                                 SWP_NOZORDER | SWP_NOACTIVATE)
-                self._mv += 1
-                if self._mv <= 4:
-                    trace(f"resize {edge} ({l},{t},{r - l},{b - t}) now={window_rect(self.target)}")
-                return 1
-            elif msg == WM_LBUTTONUP:
-                if self.restore_drag:
-                    self.restore_drag = None
-                    self.down = False
-                    return 1
-                if self.moving:
-                    r0, (sx, sy) = self.moving
-                    self.moving = None
-                    self.down = False
-                    if abs(x - sx) + abs(y - sy) <= 4:
-                        now = time.time()
-                        lt, lp_ = self.last_click
-                        if ((now - lt) <= u32.GetDoubleClickTime() / 1000.0
-                                and abs(x - lp_[0]) <= 4 and abs(y - lp_[1]) <= 4):
-                            u32.PostMessageW(self.target, WM_SYSCOMMAND,
-                                             0xF120 if u32.IsZoomed(self.target) else 0xF030, 0)
-                            trace("caption double click -> toggle maximize")
-                            self.last_click = (0.0, (0, 0))
-                        else:
-                            self.last_click = (now, (x, y))
-                    return 1
-                if self.resizing:
-                    self.resizing = None
-                    self.down = False
-                    return 1
-                self.moving = None
-                self.resizing = None
+            return 0
+        if msg == WM_LBUTTONUP:
+            u32.ReleaseCapture()
+            if self.restore_drag:
+                self.restore_drag = None
                 self.down = False
-                if self.pending or inside:
-                    name, self.pending = self.pending, None
-                    self.down = False
-                    if name:
-                        if name == "max":
-                            name = "restore" if u32.IsZoomed(self.target) else "max"
-                        u32.PostMessageW(self.target, WM_SYSCOMMAND, self.SC[name], 0)
-                        trace(f"caption click -> {name}")
-                    return 1
-        except Exception:
-            pass
-        return u32.CallNextHookEx(None, code, wparam, lparam)
+                return 0
+            if self.moving:
+                r0, (sx, sy) = self.moving
+                self.moving = None
+                self.down = False
+                if abs(x - sx) + abs(y - sy) <= 4:
+                    now = time.time()
+                    lt, lp_ = self.last_click
+                    if ((now - lt) <= u32.GetDoubleClickTime() / 1000.0
+                            and abs(x - lp_[0]) <= 4 and abs(y - lp_[1]) <= 4):
+                        u32.PostMessageW(self.target, WM_SYSCOMMAND,
+                                         0xF120 if u32.IsZoomed(self.target) else 0xF030, 0)
+                        trace("touch double click -> toggle maximize")
+                        self.last_click = (0.0, (0, 0))
+                    else:
+                        self.last_click = (now, (x, y))
+                return 0
+            name, self.pending = self.pending, None
+            self.down = False
+            if name:
+                if name == "max":
+                    name = "restore" if u32.IsZoomed(self.target) else "max"
+                u32.PostMessageW(self.target, WM_SYSCOMMAND, self.SC[name], 0)
+                trace(f"touch click -> {name}")
+            return 0
+        return 0
 
-    def _install(self):
-        self.hook = u32.SetWindowsHookExW(WH_MOUSE_LL, ctypes.cast(self._proc, ctypes.c_void_p),
-                                         k32.GetModuleHandleW(None), 0)
-        self.tid = k32.GetCurrentThreadId()
-        return self.hook
-
-    def _watch(self):
-        """A low-level hook that takes too long gets dropped by Windows without a word; if the
-        cursor moves but no events arrive, reinstall it."""
-        last = None
-        while not self.stop_flag:
-            time.sleep(0.7)
-            p = POINT()
-            u32.GetCursorPos(ctypes.byref(p))
-            pos = (p.x, p.y)
-            moved = last is not None and pos != last
-            last = pos
-            if moved and self.tid and (time.time() - self.last_event_ts) > 1.2:
-                dbg("caption hook stopped delivering, reinstalling")
-                u32.PostThreadMessageW(self.tid, WM_APP + 1, 0, 0)
-
-    def _run(self):
-        k32.SetThreadPriority(k32.GetCurrentThread(), 2)
-        u32.SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p, wt.HMODULE, wt.DWORD]
-        u32.SetWindowsHookExW.restype = wt.HHOOK
-        u32.CallNextHookEx.argtypes = [wt.HANDLE, ctypes.c_int, wt.WPARAM, wt.LPARAM]
-        u32.CallNextHookEx.restype = ctypes.c_ssize_t
-        k32.GetModuleHandleW.restype = wt.HMODULE
-        if not self._install():
-            print("caption hook failed", ctypes.GetLastError(), flush=True)
+    # -------------------------------------------------- thread / message loop
+    def run(self):
+        inst = k32.GetModuleHandleW(None)
+        wc = WNDCLASS()
+        wc.lpfnWndProc = self._proc
+        wc.hInstance = inst
+        wc.lpszClassName = "GlassTouchOverlay"
+        wc.hCursor = u32.LoadCursorW(None, 32512)
+        if not u32.RegisterClassW(ctypes.byref(wc)) and k32.GetLastError() != 1410:
+            dbg(f"touch register class failed {k32.GetLastError()}")
             return
-        threading.Thread(target=self._watch, daemon=True, name="caption-watch").start()
+        ex = WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE
+        h = u32.CreateWindowExW(ex, "GlassTouchOverlay", "", WS_POPUP,
+                                -20000, -20000, 10, 10, None, None, inst, None)
+        if not h:
+            dbg(f"touch create failed {ctypes.GetLastError()}")
+            return
+        self.hwnd = h
+        trace(f"touch overlay created hwnd={h:x}")
+        if self.stop_flag:                 # stop() raced ahead of window creation
+            u32.DestroyWindow(h)
+            self.hwnd = None
+            return
+        with self.lock:
+            a, b = self.area, self.buttons
+        if a:
+            self._reposition()             # an area may have been set before the window existed
         msg = wt.MSG()
-        while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == WM_APP + 1:
-                if self.hook:
-                    u32.UnhookWindowsHookEx(self.hook)
-                    self.hook = None
-                self._install()
-                continue
+        while not self.stop_flag and u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             u32.TranslateMessage(ctypes.byref(msg))
             u32.DispatchMessageW(ctypes.byref(msg))
-
-    def run(self):
-        self._run()
+        if self.hwnd:
+            u32.DestroyWindow(self.hwnd)
+            self.hwnd = None
 
     def stop(self):
         self.stop_flag = True
-        if self.hook:
-            u32.UnhookWindowsHookEx(self.hook)
-            self.hook = None
+        if self.hwnd:
+            u32.PostMessageW(self.hwnd, 0x8001, 0, 0)   # WM_APP+1: wake GetMessage so it exits
 
 
-# ------------------------------------------------------------ native tab strip mode
-# The self-drawn tab bar (layout_tabs / render / Overlay / Favicons) is PARKED, not removed:
-# it can only show icons by capturing pixels of the native strip, which is fragile (stray
-# backgrounds, DPI changes, sites whose icon does not key out). The product path now keeps
-# Chromium's own tab strip and cuts away only the strip BACKGROUND (comb_region), so
-# favicons, close buttons, hit-testing and drag-reorder are 100% native. See FINDINGS §11.
-NATIVE_TABS = True
 
 
-def attach_loop(hwnd, cfg, scale, dry_run=False, stop_event=None, log=print):
+def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
     """Manage ONE window until it dies or stop_event is set (blocking).
 
     Split out of main() so the daemon can run several of these in parallel threads.
+
+    The tab strip is Chromium's own. This only cuts a thin glass frame on the four sides and
+    subtracts the top-right corner for OpenGlass' Win7 caption capsules; TouchOverlay turns a
+    click on those capsules back into WM_SYSCOMMAND on the browser window.
     """
-    draw_tabs = (not NATIVE_TABS) and not dry_run
     worker = UiaWorker(hwnd)
     worker.start()
-    fav = None if (not draw_tabs or not cfg.favicons) else Favicons(hwnd, scale, cfg)
-    overlay = None if not draw_tabs else Overlay(hwnd, Theme(cfg.theme == "light"), scale, cfg, fav)
-    if overlay:
-        overlay.create()
-    hook = None
-    if overlay:
-        hook = InputHook(hwnd, overlay)
-        hook.start()
-    cap = CaptionHook(hwnd) if (not draw_tabs and cfg.gl_buttons) else None
+    cap = TouchOverlay(hwnd) if cfg.gl_buttons else None
     if cap:
         cap.start()
 
     applied = None
-    child = None
     pending = None
     pend_n = 0
     last_snap = None
     last_snap_t = 0.0
-    painted_sig = None
-    last_paint = 0.0
-    last_cap = 0.0
     btn_sig = None
 
-    def restore_regions():
-        """Parent AND D3D child, otherwise the native strip stays clipped (or the hole stays)."""
+    def restore_region():
+        """Parent region, plus the D3D child in case an older build left a hole there."""
         if u32.IsWindow(hwnd):
             u32.SetWindowRgn(hwnd, None, True)
+        child = d3d_child(hwnd)
         if child and u32.IsWindow(child):
             u32.SetWindowRgn(child, None, True)
 
@@ -1924,44 +814,39 @@ def attach_loop(hwnd, cfg, scale, dry_run=False, stop_event=None, log=print):
                 log("window gone")
                 break
             if u32.IsIconic(hwnd) or not u32.IsWindowVisible(hwnd):
-                if hook:
-                    hook.set_band(None)
-                if overlay:
-                    u32.ShowWindow(overlay.hwnd, 0)
+                if cap:
+                    cap.clear()
                 if applied:
                     trace(f"clear region: iconic/hidden {hwnd:x}")
-                    restore_regions()
+                    restore_region()
                     applied = None
                 time.sleep(0.2)
                 continue
 
             win = window_rect(hwnd)
             if cap and cap.busy:
-                # A hand move/resize is in flight: the region is expressed in window
-                # coordinates so it follows the window by itself. Touching it here (or
-                # re-reading UIA, which still reports the old rect) is what made the hole
-                # blink away mid-drag and the window look like it reset.
+                # A hand move started by the overlay is in flight: the region is expressed in
+                # window coordinates so it follows the window by itself. Touching it (or
+                # re-reading UIA, which still reports the old rect) is what made the hole blink
+                # away mid-drag and the window look like it reset.
                 time.sleep(0.05)
                 continue
             if is_fullscreen(hwnd, win):
                 if applied:
-                    restore_regions()
+                    restore_region()
                     applied = None
                     pending, pend_n = None, 0
                     trace(f"clear region: fullscreen {hwnd:x}")
                     log("fullscreen -> region cleared")
-                if overlay:
-                    u32.ShowWindow(overlay.hwnd, 0)
                 if cap:
-                    cap.set_area(None, {})
-                    cap.set_frame(None, 0)
+                    cap.clear()
                 time.sleep(0.25)
                 continue
             snap = worker.latest()
             if not snap or not snap.band or snap.win != win:
                 # A hand-drag moves the window every few ms, so the UIA snapshot is always one
                 # step behind. Being strict here cleared the hole and repainted the native
-                # frame on every loop while dragging — the window looked like it "reset".
+                # frame on every loop while dragging -- the window looked like it "reset".
                 # A pure move (same size) is handled by shifting the last good snapshot.
                 if (last_snap and last_snap.band and (time.time() - last_snap_t) < 10.0):
                     # Size may have changed too (restore-from-maximised, edge drag): the band
@@ -1976,82 +861,72 @@ def attach_loop(hwnd, cfg, scale, dry_run=False, stop_event=None, log=print):
                     if applied and (win[2] - win[0], win[3] - win[1]) == applied[0]:
                         time.sleep(0.1)
                         continue
-                    if hook:
-                        hook.set_band(None)
                     if applied:
                         trace(f"clear region: no usable snapshot (win={win})")
-                        restore_regions()
+                        restore_region()
                         applied = None
-                    if overlay:
-                        u32.ShowWindow(overlay.hwnd, 0)
+                    if cap:
+                        cap.clear()
                     time.sleep(0.15)
                     continue
             elif snap is not None:
                 last_snap, last_snap_t = snap, time.time()
 
             band = (win[0] + 1, snap.band[1], win[2] - 1, snap.band[3])
-            if hook:
-                hook.set_band(band)
-            if child is None or not u32.IsWindow(child):
-                child = d3d_child(hwnd)
-            if draw_tabs:
-                cuts = None
-                n = cr = 0
-                key = (band, None)
-            else:
-                # Native strip mode: thin glass frame on four sides, and the strip area from
-                # the + button to the right edge is handed to OpenGlass (its Win7 caption
-                # buttons get drawn there). Tab bodies are never touched.
-                n = max(1, int(round(cfg.frame_px * scale)))
-                cr = max(0, int(round(cfg.corner_px * scale)))
+            # Thin glass frame on four sides, and the strip area from the + button to the
+            # right edge handed to OpenGlass (its Win7 caption buttons are drawn there).
+            # Tab bodies are never touched.
+            n = max(1, int(round(cfg.frame_px * scale)))
+            cr = max(0, int(round(cfg.corner_px * scale)))
+            # The frame itself comes from insetting the region (frame_region); only the
+            # OpenGlass caption corner is subtracted on top of it.
+            cuts = []
+            if cfg.gl_buttons and snap.band:
+                # Two geometries have to agree: the hole (what OpenGlass paints in) starts
+                # at the right of the native `+` -- that area is empty strip background and
+                # the `+` keeps its own hit-testing -- while the Win7 capsules OpenGlass
+                # draws come from win7_caption_buttons(), never from Chromium's UIA button
+                # rects (46 DIP wide, 6 DIP right margin: tens of px off at 200% DPI).
+                # Nothing swallows clicks here any more, so the hole covers every pixel a
+                # native button could occupy: a click that reaches one fires a command
+                # nobody drew.
+                btns = win7_caption_buttons(win, snap.band, scale, cfg)
+                native = (snap.min_r, snap.max_r, snap.close_r)
+                x = btns["min"][0] - int(2 * scale)        # hole always covers the capsules
+                if snap.newtab_r:
+                    x = min(x, snap.newtab_r[2] + int(2 * scale))
+                else:
+                    btn_left = min((r[0] for r in native if r), default=None)
+                    if btn_left is not None:
+                        x = min(x, btn_left - int(6 * scale))
+                # Chromium's own buttons must sit fully inside the hole as well: wherever one
+                # pokes out, a click can reach a button that is not even drawn. Without a
+                # hook to block those clicks, the hole has to cover them itself.
+                for r in native:
+                    if r:
+                        x = min(x, r[0] - int(2 * scale))
+                x = max(win[0] + n, x) // 2 * 2
+                # 挖孔底部修正：band[3]（UIA 标签带底部）可能比真实标题栏下缘低几个像素，
+                # 导致挖孔侵入窗口内容区；btn_h_fix_px（负值）把挖孔底部往上收。
+                fix = int(round(cfg.btn_h_fix_px * scale))
+                corner = (x, snap.band[1] // 2 * 2, win[2], (snap.band[3] + fix) // 2 * 2)
+                # bottom-left corner rounded: the window keeps a small arc where the cut
+                # meets the toolbar instead of a hard 90 degree notch
+                cuts.extend(round_corner_cut(corner[0], corner[1], corner[2], corner[3],
+                                             max(3, int(round(6 * scale)))))
                 if cap:
-                    cap.set_frame(win, n)
-                # The frame itself comes from insetting the region (frame_region); only the
-                # OpenGlass caption corner is subtracted on top of it.
-                cuts = []
-                if cfg.gl_buttons and snap.band:
-                    # Two geometries have to agree: the hole (what OpenGlass paints in) starts
-                    # at the right of the native `+` -- that area is empty strip background and
-                    # the `+` keeps its own hit-testing -- while the capsule hit table comes
-                    # from the *drawn* Win7 metrics, never from Chromium's UIA button rects
-                    # (46 DIP wide, 6 DIP right margin: tens of px off at 200% DPI, which is
-                    # why clicking the drawn `−` used to fire the native `□`).
-                    btns = win7_caption_buttons(win, snap.band, scale, cfg)
-                    native = (snap.min_r, snap.max_r, snap.close_r)
-                    x = btns["min"][0] - int(2 * scale)        # hole always covers the capsules
-                    if snap.newtab_r:
-                        x = min(x, snap.newtab_r[2] + int(2 * scale))
-                    else:
-                        btn_left = min((r[0] for r in native if r), default=None)
-                        if btn_left is not None:
-                            x = min(x, btn_left - int(6 * scale))
-                    # Chromium's own buttons must sit fully inside the hole as well: wherever one
-                    # pokes out, a click can still reach it. (The hook blocks those clicks too,
-                    # but a hole that covers them is the cheaper guarantee.)
-                    for r in native:
-                        if r:
-                            x = min(x, r[0] - int(2 * scale))
-                    x = max(win[0] + n, x) // 2 * 2
-                    corner = (x, snap.band[1] // 2 * 2, win[2], snap.band[3] // 2 * 2)
-                    # bottom-left corner rounded: the window keeps a small arc where the cut
-                    # meets the toolbar instead of a hard 90 degree notch
-                    cuts.extend(round_corner_cut(corner[0], corner[1], corner[2], corner[3],
-                                                 max(3, int(round(6 * scale)))))
-                    if cap:
-                        cap.set_area(corner, btns, native)
-                    if btns != btn_sig:
-                        btn_sig = btns
-                        trace("buttons hole=%s %s" % (corner, " ".join(
-                            f"{k}={v}" for k, v in btns.items())))
-                elif cap:
-                    cap.set_area(None, {})
-                cuts = tuple(cuts)
-                # Keys are window-RELATIVE: a plain move does not change the region (it is
-                # expressed in window coordinates), so re-applying it on every mouse move
-                # during a drag is pure flicker.
-                rel = tuple((c[0] - win[0], c[1] - win[1], c[2] - win[0], c[3] - win[1])
-                            for c in cuts)
-                key = ((win[2] - win[0], win[3] - win[1]), n, cr, rel)
+                    cap.set_area(corner, btns)
+                if btns != btn_sig:
+                    btn_sig = btns
+                    trace("buttons hole=%s %s" % (corner, " ".join(
+                        f"{k}={v}" for k, v in btns.items())))
+            cuts = tuple(cuts)
+            # Keys are window-RELATIVE: a plain move does not change the region (it is
+            # expressed in window coordinates), so re-applying it on every mouse move
+            # during a drag is pure flicker.
+            rel = tuple((c[0] - win[0], c[1] - win[1], c[2] - win[0], c[3] - win[1])
+                        for c in cuts)
+            key = ((win[2] - win[0], win[3] - win[1]), n, cr, rel)
             if applied != key:
                 # A size change must be applied at once; a band appearing/disappearing has to
                 # be stable for 3 samples first, otherwise UIA flicker in fullscreen / during
@@ -2060,53 +935,26 @@ def attach_loop(hwnd, cfg, scale, dry_run=False, stop_event=None, log=print):
                 pend_n = pend_n + 1 if pending == key else 1
                 pending = key
                 if size_changed or pend_n >= 3:
-                    if draw_tabs:
-                        rgn = clip_region(win, band)
-                        crgn = child_cut_region(child, band)
-                    else:
-                        rgn = frame_region(win, cuts, n, cr)
-                        crgn = None
+                    # Edge's visible content starts at its client left edge (the window rect
+                    # has an invisible resize border), so the left arc must start there or
+                    # the content clips it into a flat ellipse.
+                    pt = wt.POINT(0, 0)
+                    u32.ClientToScreen(hwnd, ctypes.byref(pt))
+                    rgn = frame_region(win, cuts, n, cr, max(0, pt.x - win[0]))
                     if rgn:
                         u32.SetWindowRgn(hwnd, rgn, True)
-                    if crgn:
-                        u32.SetWindowRgn(child, crgn, True)
                     applied = key
-                    trace(f"apply region win={win} cuts={len(cuts or ())} n={n} r={cr}")
+                    trace(f"apply region win={win} cuts={len(cuts)} n={n} r={cr}")
                     pending, pend_n = None, 0
-                    log(f"frame {band} tabs={len(snap.tabs)} native={not draw_tabs} "
-                        f"cuts={len(cuts or ())} child={child and hex(child)}")
-            if overlay:
-                sig = (snap.signature(), band)
-                now = time.time()
-                # Icons: the capture clears the region for ~80 ms, so it is rate-limited and
-                # done right before a repaint (the overlay freezes the bar first -> no flash).
-                if fav and (now - last_cap) >= 1.0 and fav.missing(snap):
-                    last_cap = now
-                    if fav.capture(snap, overlay, band, win):
-                        painted_sig = None
-                if overlay.pending_hover != overlay.hover and (now - last_paint) >= 0.04:
-                    overlay.paint(snap, overlay.pending_hover)
-                    painted_sig = sig
-                    last_paint = now
-                # throttle: a full recompose is ~10 ms of GIL, and the mouse hook lives here too
-                elif sig != painted_sig and (now - last_paint) >= 0.25:
-                    overlay.paint(snap, overlay.pending_hover)
-                    painted_sig = sig
-                    last_paint = now
-                else:
-                    overlay.raise_above()
+                    log(f"frame {band} tabs={len(snap.tabs)} cuts={len(cuts)}")
             time.sleep(0.1)
     except Exception as e:
         log(f"attach loop error {e!r}")
     finally:
         worker.stop()
-        if hook:
-            hook.stop()
         if cap:
             cap.stop()
-        if overlay:
-            u32.DestroyWindow(overlay.hwnd)
-        restore_regions()
+        restore_region()
         log("region reset")
 
 
@@ -2117,15 +965,8 @@ def main():
     g.add_argument("--pid", type=int)
     ap.add_argument("--theme", choices=("dark", "light"), default=None)
     ap.add_argument("--settings", default=None, help="settings.json path")
-    ap.add_argument("--tab-max-width", type=int, default=None, help="CSS px cap for a tab")
-    ap.add_argument("--no-hover", action="store_true")
-    ap.add_argument("--no-favicons", action="store_true")
-    ap.add_argument("--dry-run", action="store_true", help="cut the hole only, no redraw")
     ap.add_argument("--reset", action="store_true", help="only restore the window region and exit")
     ap.add_argument("--scale", type=float, default=0.0)
-    ap.add_argument("--fix-timeout", action="store_true",
-                    help="raise HKCU LowLevelHooksTimeout to 1000 ms (stops clicks leaking when "
-                         "the hook is slow); takes effect for newly installed hooks")
     a = ap.parse_args()
 
     hwnd = a.hwnd or find_window_by_pid(a.pid)
@@ -2142,14 +983,7 @@ def main():
         print(f"region reset on {hwnd}")
         return 0
 
-    if a.fix_timeout:
-        import winreg
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop") as k:
-            winreg.SetValueEx(k, "LowLevelHooksTimeout", 0, winreg.REG_DWORD, 1000)
-        print("LowLevelHooksTimeout = 1000 ms (restart the tool / hook to pick it up)")
-    cfg = Settings(a.settings, theme=a.theme, tab_max_width=a.tab_max_width,
-                   hover=False if a.no_hover else None,
-                   favicons=False if a.no_favicons else None)
+    cfg = Settings(a.settings, theme=a.theme)
     dpi = u32.GetDpiForWindow(hwnd) or 96
     scale = a.scale or dpi / 96.0
     u32.SetWindowRgn(hwnd, None, True)          # clear a hole left behind by a killed run
@@ -2159,7 +993,7 @@ def main():
     print(f"target hwnd={hwnd} rect={window_rect(hwnd)} dpi={dpi} scale={scale:.2f} "
           f"settings={cfg.path}", flush=True)
     try:
-        attach_loop(hwnd, cfg, scale, dry_run=a.dry_run)
+        attach_loop(hwnd, cfg, scale)
     except KeyboardInterrupt:
         pass
     return 0

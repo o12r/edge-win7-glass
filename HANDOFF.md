@@ -7,14 +7,13 @@
 
 Windows 上所有 Chromium 系浏览器窗口被守护进程接管：四边各切 `frame_px`（默认 4 CSS px）
 露出 OpenGlass 玻璃，右上角（`+` 右侧到窗口右缘、标签带高度）整块挖掉，由 OpenGlass 画
-Win7 胶囊按钮 `− □ ✕`；那个角落的点击由 `CaptionHook` 转成 `WM_SYSCOMMAND` 发回窗口。
-**命中表按 Win7 胶囊指标算（`win7_caption_buttons()`），不用 UIA 里 Chromium 的按钮矩形**
-——两套几何差 4~60 px，点画出来的 `−` 会落到原生 `□` 上（FINDINGS §11.13）。空白处拖动/
-双击最大化，四边手写缩放也在这个钩子里。
+Win7 胶囊按钮 `− □ ✕`；那个角落上盖一个**隐形分层窗口（`TouchOverlay`）**，由它自己的
+WndProc 直接收鼠标：点胶囊转成 `WM_SYSCOMMAND` 发回窗口，空白处拖动/双击最大化。
+**命中表按 Win7 胶囊指标算（`win7_caption_buttons()`），覆盖窗 rect = 挖洞 rect**——洞、
+覆盖窗、命中三者同一源，点画出来的 `−` 不会落到原生 `□` 上（FINDINGS §11.13 / §12）。
 **标签条完全是 Chromium 原生的**：图标、文字、关闭按钮、命中、拖拽重排都不用我们操心。
-洞里的任何点击都会把窗口拉到前台；拖四边的手动缩放也在 `CaptionHook` 里实现（get 不到
-Chromium 自己的 resize 边框）。**全屏（F11）不接管**：只清一次 region 就撒手，否则
-Chromium 全屏下自动显隐的标签条会让洞闪。
+洞里的任何点击都会把窗口拉到前台。四边 resize 本轮不做（以后单独补覆盖窗）。**全屏
+（F11）不接管**：只清一次 region 就撒手，否则 Chromium 全屏下自动显隐的标签条会让洞闪。
 
 ## 怎么跑
 
@@ -74,7 +73,7 @@ GLASS_TITLEBAR_DUMP=1             # → %TEMP%\gt_last.png（实际送进 Update
 | 悬停标签 / `×` / `+` / 箭头 | 高亮（40 ms 节流） |
 | 拖空白处 | 移动窗口 |
 | 双击空白处 | 最大化 / 还原 |
-| 原生 `− □ ✕` | 由钩子转 `WM_SYSCOMMAND`，正常 |
+| 原生 `− □ ✕`（OpenGlass 胶囊） | 由覆盖窗转 `WM_SYSCOMMAND`（§12 改，待真实点击复验） |
 | 全屏 (F11) | band 消失 → 立即清洞，按钮恢复可用 |
 | 窗口移动/最大化 | 洞与覆盖层跟随（UIA 每 0.2s 采样） |
 | 1 / 4 / 12 个标签 | 宽度 440 / 440 / 168 px，全部落在 `+` 左侧，点击精度不变 |
@@ -97,14 +96,12 @@ GLASS_TITLEBAR_DUMP=1             # → %TEMP%\gt_last.png（实际送进 Update
   - `Favicons` — `freeze` + 清 region + `PrintWindow(D3D 子窗)` + 回填 region，
     按 `_stable(title)` 缓存；`key_icon()` 做背景键控 + 按主题给字形染色。
   - `Theme` / `render()` / `vgrad()` — Pillow 合成 RGBA（渐变条 + 圆角遮罩有缓存）。
-  - `Overlay` — `UpdateLayeredWindow` 的 per-pixel alpha 窗口；`paint()` 渲染 + 命中表，
-    `freeze()` 贴不透明「当前屏幕帧」，`hover_at()` 给钩子做廉价命中查询；
-    `raise_above()` 插到浏览器正上方（插错边会被 OpenGlass 当背景模糊掉）。
-  - `InputHook` — `WH_MOUSE_LL`：吞掉 band 内点击 → **一律入队**（`_drain` 执行）；
-    鼠标移动只在 band 内做悬停记录；滚轮切标签；`_drag_loop` 轮询 `GetCursorPos` 移动窗口；
-    `_watch` 看门狗检测钩子被系统丢掉并重装。
+  - `Overlay` — `UpdateLayeredWindow` 的 per-pixel alpha 窗口（自绘模式用，已停用未接线）。
+  - `TouchOverlay` — 隐形分层窗口（alpha=1），盖在挖洞 rect 上，自己的消息循环收鼠标：
+    胶囊点击 → `WM_SYSCOMMAND`、空白拖动/双击最大化、洞内点击 → 前台；`SetCapture` 保证
+    拖动不丢（FINDINGS §12）。四边 resize 不做。
   - `attach_loop()` — 单窗口主循环：快照 → 校验（全屏/陈旧矩形就清洞）→ 设 region →
-    抓图标 → 节流重绘。CLI（`main()`）和守护进程共用。
+    驱动 `TouchOverlay.set_area` → 节流重绘。CLI（`main()`）和守护进程共用。
 
 ## 已知限制 / 下一步可做
 
@@ -131,7 +128,7 @@ GLASS_TITLEBAR_DUMP=1             # → %TEMP%\gt_last.png（实际送进 Update
 
 ## 相关文件
 
-- `tools/native/glass_titlebar.py` — 当前主工具（`frame_region` + 原生标签 + `CaptionHook`；
+- `tools/native/glass_titlebar.py` — 当前主工具（`frame_region` + 原生标签 + `TouchOverlay`；
   自绘那套 `layout_tabs`/`render`/`Overlay`/`Favicons` 仍在文件里但未接线）
 - `tools/native/gt_daemon.py` — 守护进程 + 托盘 + 设置页
 - `tools/native/launch.bat` — 无控制台启动守护进程

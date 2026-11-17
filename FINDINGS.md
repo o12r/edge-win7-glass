@@ -503,3 +503,54 @@ UIA 里 Chromium 的按钮矩形（46 DIP 宽、右缘距窗口 6 DIP），和 O
    （接管第一帧、band 还没稳定、region 被清过）也不给应用，按同 x 对应的胶囊转发
    `WM_SYSCOMMAND`，日志 `native button blocked (x,y) -> min|max|close`。
 3. **右/中键与滚轮在洞里一律吞掉**（`return 1`），不再漏给桌面或下层窗口。
+
+## 12. 输入接管从 `WH_MOUSE_LL` 钩子改为隐形覆盖窗（TouchOverlay）
+
+方向调整：**不再用 Edge 原生 / OpenGlass 的 caption button 触控，也不再用全局低层鼠标钩子**，
+而是在挖洞的 rect 上盖一个**隐形分层窗口**，由它自己的 WndProc 直接收鼠标消息，接管
+顶部的拖拽与 caption button。四边 resize 本轮不做，以后单独补。
+
+### 12.1 关键前提：alpha=1 的层窗口是可点击的（推翻 §8.1 的旧结论）
+
+`alpha_probe.py` 实测 `WindowFromPoint`：
+
+| 层窗口像素 alpha | 中心点命中 | 结论 |
+|---|---|---|
+| alpha = 1 | **overlay=True**（命中覆盖窗） | 可点击 |
+| alpha = 0 | overlay=False（穿透到下层） | 穿透 |
+
+→ §8.1「alpha=1 也收不到 `WM_LBUTTONDOWN`」是当年那个 `Overlay` 的 `_wndproc` 返回了
+`HTTRANSPARENT` 造成的，不是 alpha=1 本身的问题。DWM 的命中测试只看「alpha 是否为 0」：
+只要非 0 就命中。所以隐形覆盖窗用 **alpha=1 的位图 + 不返回 `HTTRANSPARENT`** 即可
+「看得见摸不着」的相反面——「看不见但摸得着」。
+
+### 12.2 TouchOverlay 设计（`glass_titlebar.py`）
+
+- 独立线程跑消息循环（`GetMessageW`）；`WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`，
+  `UpdateLayeredWindow` 贴全 alpha=1 位图；`WM_MOUSEACTIVATE` 返回 `MA_NOACTIVATE`（不抢焦点）。
+- **覆盖 rect = 挖洞 rect**（同一个 `corner`），按钮命中表 = `win7_caption_buttons()`（与
+  OpenGlass 画的 Win7 胶囊对齐）。洞、覆盖窗、命中三者同一源，§11.12/11.13 的「两套几何错位」
+  整类 bug 从结构上消失。
+- 行为照搬 CaptionHook 的验证逻辑：按钮 → `WM_SYSCOMMAND`；空白按下 → 拖窗（最大化时
+  restore-drag）；空白双击 → 最大化/还原；洞内任意点击 → `force_foreground`。
+- **`SetCapture` 保证拖动不丢**：`WM_LBUTTONDOWN` 时捕获，鼠标移出 overlay 仍收
+  `WM_MOUSEMOVE`/`WM_LBUTTONUP`，不再需要 `GetAsyncKeyState` 守卫（§11.8 坑2 直接不存在）。
+- 阻塞调用（`SetForegroundWindow`/`AttachThreadInput`）照旧丢 `touch-worker` 线程。
+- 消息循环的 `stop()` 竞态：`run()` 里窗口创建后先查 `stop_flag`，已置位就立刻销毁返回，
+  避免 `GetMessage` 空等。
+
+### 12.3 为什么换掉钩子
+
+`WH_MOUSE_LL` 那套的坑（§8.3/§11.5/§11.8）——回调超时被系统**静默卸载**、需要看门狗重装、
+双守护进程互相吃掉 `LBUTTONUP`、`GetAsyncKeyState` 对注入事件返回 0——在「覆盖窗收自己
+消息」模型下**全部消失**：窗口消息不走全局钩子链，没有超时卸载，没有多实例竞争，事件流
+（down/move/up）由系统保证送达。
+
+### 12.4 已验证（临时 profile 冒烟）
+
+- `attach_loop` 挖洞正常（`frame ... native=True cuts=13`），`region reset` 干净退出；
+- `touch overlay created hwnd=2f044c` —— 覆盖窗创建成功；
+- 按钮几何 `hole=(...) close=... max=... min=...` 与 §11.12 像素列一致。
+- 待用户真实点击验证：点胶囊 → `touch click -> min|max|close`；拖空白 → 窗口移动；
+  双击空白 → 最大化/还原（日志在 `%LOCALAPPDATA%\\edge-win7-glass\\tool-debug.log`）。
+
