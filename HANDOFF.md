@@ -30,7 +30,7 @@ cd /c/Users/oscar/Projects/edge-win7-glass
 - 自动接管**所有** Chromium 系浏览器窗口（msedge/chrome/brave/vivaldi/chromium/opera/
   yandex/thorium），新建窗口 1 秒内接管。
 - 设置页：<http://127.0.0.1:8721/>（托盘左键也能打开）；保存后自动重新接管。
-- 托盘右键：打开设置页 / 浅色 / 深色 / 暂停接管 / 开机自启 / 退出。
+- 托盘右键：打开设置页 / 暂停接管 / 开机自启 / 退出。
 - 退出一定还原所有窗口 region（`GetWindowRgn` 返回 0 验证过）。
 - 测试只想接管一个窗口时：`GT_ONLY_HWND=<hwnd> python gt_daemon.py --console`。
 
@@ -41,7 +41,7 @@ cd /c/Users/oscar/Projects/edge-win7-glass
 
 # 挂到某个 Edge 窗口（PID 或 hwnd 二选一）
 .venv/Scripts/python.exe tools/native/glass_titlebar.py --pid <msedge pid>
-.venv/Scripts/python.exe tools/native/glass_titlebar.py --hwnd 0x... --theme dark|light
+.venv/Scripts/python.exe tools/native/glass_titlebar.py --hwnd 0x...
 
 # 常用开关
 --settings <path>        # 换配置文件，默认 %APPDATA%\edge-win7-glass\settings.json

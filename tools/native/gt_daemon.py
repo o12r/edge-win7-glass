@@ -4,7 +4,7 @@ gt_daemon.py - background service for the glass title bar.
 One process that
   * watches for Chromium browser windows and attaches the glass bar to each of them,
   * serves a settings page on http://127.0.0.1:8721 (edit settings.json from the browser),
-  * sits in the notification area (tray menu: settings / theme / pause / autostart / quit).
+  * sits in the notification area (tray menu: settings / pause / autostart / quit).
 
 usage
   pythonw tools/native/gt_daemon.py          # start (or just: no console window)
@@ -30,6 +30,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import glass_titlebar as gt  # noqa: E402
+import gt_i18n as i18n       # noqa: E402
 
 u32 = ctypes.windll.user32
 k32 = ctypes.windll.kernel32
@@ -248,16 +249,14 @@ class WNDCLASS(ctypes.Structure):
                 ("lpszClassName", wt.LPCWSTR)]
 
 
+# (command id, i18n key) -- a `None` key draws a separator.
 MENU_ITEMS = [
-    (1, "打开设置页"),
-    (2, "——"),
-    (10, "浅色标签"),
-    (11, "深色标签"),
-    (3, "——"),
-    (20, "暂停接管"),
-    (21, "开机自启"),
-    (4, "——"),
-    (30, "退出"),
+    (1, "menu_settings"),
+    (2, None),
+    (20, "menu_pause"),
+    (21, "menu_autostart"),
+    (4, None),
+    (30, "menu_quit"),
 ]
 
 
@@ -307,20 +306,16 @@ class Tray:
     def _show_menu(self):
         m = u32.CreatePopupMenu()
         self._menu = m
-        light = self.d.cfg.theme == "light"
         paused = self.d.paused
         autostart = autostart_state()
-        for mid, text in MENU_ITEMS:
-            if mid == 2 or mid == 3 or mid == 4:
+        for mid, key in MENU_ITEMS:
+            if key is None:
                 u32.AppendMenuW(m, MF_SEPARATOR, 0, None)
                 continue
             flags = MF_STRING
-            if mid == 10 and light:
-                flags |= MF_CHECKED
-            if mid == 11 and not light:
-                flags |= MF_CHECKED
+            text = i18n.t(self.d.lang, key)
             if mid == 20:
-                text = "恢复接管" if paused else "暂停接管"
+                text = i18n.t(self.d.lang, "menu_resume" if paused else "menu_pause")
                 flags |= MF_CHECKED if paused else 0
             if mid == 21 and autostart:
                 flags |= MF_CHECKED
@@ -365,6 +360,8 @@ class Attach:
 class Daemon:
     def __init__(self):
         self.cfg = gt.Settings()
+        self.lang_setting = self.cfg.lang            # "auto" / "zh" / "en"
+        self.lang = i18n.resolve(self.lang_setting)  # effective language
         self.attached = {}
         self.failed = {}
         self.paused = False
@@ -436,8 +433,10 @@ class Daemon:
 
     def refresh_tip(self):
         if self.tray:
-            n = len(self.attached)
-            state = "已暂停" if self.paused else f"{n} 个窗口"
+            if self.paused:
+                state = i18n.t(self.lang, "tip_paused")
+            else:
+                state = i18n.t(self.lang, "tip_windows", n=len(self.attached))
             self.tray.set_tip(f"Edge Win7 Glass · {state}")
 
     # ---------------- settings / actions
@@ -452,6 +451,10 @@ class Daemon:
             json.dump(data, f, indent=2, ensure_ascii=False)
         if "autostart" in new:
             set_autostart(bool(new["autostart"]))
+        if "lang" in new:
+            self.lang_setting = new["lang"] if new["lang"] in i18n.LANGS else "auto"
+            self.lang = i18n.resolve(self.lang_setting)
+        self.cfg.data.update(data)
         log(f"settings saved: {new}")
         # Hot-reconnect (detach + re-attach) leaves stale overlay/region state behind, so
         # applying settings now does a clean restart: close the browsers (saving their
@@ -532,10 +535,6 @@ class Daemon:
     def command(self, cid):
         if cid == 1:
             self.open_settings()
-        elif cid == 10:
-            self.apply_settings({"theme": "light"})
-        elif cid == 11:
-            self.apply_settings({"theme": "dark"})
         elif cid == 20:
             self.paused = not self.paused
             if self.paused:
@@ -562,6 +561,7 @@ class Daemon:
                      "alive": a.thread.is_alive()} for h, a in self.attached.items()]
         return {"port": self.http_port, "paused": self.paused,
                 "autostart": autostart_state(), "windows": wins,
+                "lang": self.lang, "auto_lang": i18n.system_lang(),
                 "settings": self.cfg.data}
 
     # ---------------- http
@@ -634,43 +634,62 @@ class Daemon:
 
 
 # ------------------------------------------------------------------ settings page
-PAGE = r"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
-<title>Edge Win7 Glass · 设置</title>
+PAGE = r"""<!doctype html><html lang="__HTML_LANG__" class="pending"><meta charset="utf-8">
+<title>Edge Win7 Glass · Settings</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
- :root{color-scheme:dark}
+ html.pending body{opacity:0}
+ :root{color-scheme:light dark;
+   --fg:#1b2530; --sub:#5f7284; --h2:#5a6d80; --ul:#3d4f61; --muted:#5b6b7c;
+   --bg:linear-gradient(160deg,#f6f9fc,#e8eef6 60%);
+   --card:rgba(255,255,255,.75); --card-bd:rgba(20,40,60,.12);
+   --row-bd:rgba(20,40,60,.09);
+   --input-bg:#fff; --input-fg:#1b2530; --input-bd:rgba(20,40,60,.22);
+   --ghost-bg:rgba(20,40,60,.07); --ghost-fg:#2b3d4e;
+   --toast-bg:#e4f7ec; --toast-bd:#8fd8b1; --toast-fg:#186b42;
+ }
+ @media (prefers-color-scheme:dark){
+  :root{--fg:#e6edf5; --sub:#8fa3b8; --h2:#9fb4c9; --ul:#b9c9d8; --muted:#7f93a8;
+   --bg:linear-gradient(160deg,#1b2530,#0f151c 60%);
+   --card:rgba(255,255,255,.06); --card-bd:rgba(255,255,255,.10);
+   --row-bd:rgba(255,255,255,.06);
+   --input-bg:rgba(0,0,0,.35); --input-fg:#e6edf5; --input-bd:rgba(255,255,255,.14);
+   --ghost-bg:rgba(255,255,255,.10); --ghost-fg:#dce8f4;
+   --toast-bg:#1d3b2a; --toast-bd:#2f6b4a; --toast-fg:#b9f5d0;
+  }
+ }
  *{box-sizing:border-box}
  body{margin:0;font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif;
-      background:linear-gradient(160deg,#1b2530,#0f151c 60%);color:#e6edf5;min-height:100vh;padding:32px}
+      background:var(--bg);color:var(--fg);min-height:100vh;padding:32px}
  .wrap{max-width:760px;margin:0 auto}
  h1{font-size:20px;font-weight:600;margin:0 0 4px}
- .sub{color:#8fa3b8;margin-bottom:24px}
- .card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);
+ .sub{color:var(--sub);margin-bottom:24px}
+ .card{background:var(--card);border:1px solid var(--card-bd);
        border-radius:12px;padding:18px 20px;margin-bottom:16px;backdrop-filter:blur(8px)}
- .card h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#9fb4c9;margin:0 0 14px}
+ .card h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--h2);margin:0 0 14px}
  .row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:9px 0;
-      border-bottom:1px solid rgba(255,255,255,.06)}
+      border-bottom:1px solid var(--row-bd)}
  .row:last-child{border-bottom:0}
  .row label{flex:1}
- .hint{color:#7f93a8;font-size:12px}
+ .hint{color:var(--muted);font-size:12px}
  input[type=number]{width:90px}
- input[type=number],select{background:rgba(0,0,0,.35);color:#e6edf5;border:1px solid rgba(255,255,255,.14);
+ input[type=number],select{background:var(--input-bg);color:var(--input-fg);border:1px solid var(--input-bd);
       border-radius:8px;padding:6px 8px}
  input[type=range]{width:220px}
  input[type=checkbox]{width:18px;height:18px;accent-color:#4aa3ff}
  .btns{display:flex;gap:10px;margin-top:18px}
  button{border:0;border-radius:9px;padding:9px 16px;font-size:14px;cursor:pointer;
         background:#2b6cb0;color:#fff}
- button.ghost{background:rgba(255,255,255,.10);color:#dce8f4}
+ button.ghost{background:var(--ghost-bg);color:var(--ghost-fg)}
  button.danger{background:#8c2b2b}
  button:hover{filter:brightness(1.12)}
  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;
-       background:rgba(90,200,140,.18);color:#7fe0ac;margin-left:8px}
- .pill.off{background:rgba(255,255,255,.10);color:#9fb4c9}
- ul{margin:8px 0 0;padding-left:18px;color:#b9c9d8}
+       background:rgba(90,200,140,.18);color:#2f8f5f;margin-left:8px}
+ .pill.off{background:var(--ghost-bg);color:var(--sub)}
+ ul{margin:8px 0 0;padding-left:18px;color:var(--ul)}
  .card.off{opacity:.55}
- #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#1d3b2a;
-        border:1px solid #2f6b4a;color:#b9f5d0;padding:9px 16px;border-radius:10px;opacity:0;
+ #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:var(--toast-bg);
+        border:1px solid var(--toast-bd);color:var(--toast-fg);padding:9px 16px;border-radius:10px;opacity:0;
         transition:opacity .25s;pointer-events:none}
  #toast.show{opacity:1}
  @media (max-width:760px){
@@ -681,86 +700,122 @@ PAGE = r"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
  }
 </style>
 <div class="wrap">
- <h1>Edge Win7 Glass <span class="pill" id="state">读取中…</span></h1>
- <div class="sub">原生标签 + 四边窄玻璃边框 · 设置保存在 <code>%APPDATA%\edge-win7-glass\settings.json</code></div>
+ <h1>Edge Win7 Glass <span class="pill" id="state" data-i18n="loading">读取中…</span></h1>
+ <div class="sub"><span data-i18n="subtitle"></span> <code>%APPDATA%\edge-win7-glass\settings.json</code></div>
 
  <div class="card">
-  <h2>外观</h2>
-  <div class="row"><label>玻璃边框宽度 <span class="hint">CSS px，四边各切这么宽露玻璃</span></label>
+  <h2 data-i18n="sec_appearance">外观</h2>
+  <div class="row"><label><span data-i18n="frame_px"></span> <span class="hint" data-i18n="frame_px_hint"></span></label>
    <input type="number" id="frame_px" min="1" max="16" step="1"></div>
-  <div class="row"><label>顶角圆角 <span class="hint">CSS px，左右上角；0 = 直角</span></label>
+  <div class="row"><label><span data-i18n="corner_px"></span> <span class="hint" data-i18n="corner_px_hint"></span></label>
    <input type="number" id="corner_px" min="0" max="24" step="1"></div>
-  <div class="row"><label>右上角用 OpenGlass 按钮<div class="hint">挖掉 Chromium 按钮区，让 OpenGlass 画 Win7 胶囊按钮（本体点击会被转发）</div></label>
+  <div class="row"><label><span data-i18n="gl_buttons"></span><div class="hint" data-i18n="gl_buttons_hint"></div></label>
    <input type="checkbox" id="gl_buttons"></div>
-  <div class="row"><label>胶囊右缘留白 <span class="hint">DIP，OpenGlass 画的是 Win7 指标（默认 7）</span></label>
+  <div class="row"><label><span data-i18n="btn_pad_right_px"></span> <span class="hint" data-i18n="btn_pad_right_px_hint"></span></label>
    <input type="number" id="btn_pad_right_px" min="0" max="30" step="1"></div>
-  <div class="row"><label>−/□ 胶囊宽度 <span class="hint">DIP（默认 30）</span></label>
+  <div class="row"><label><span data-i18n="btn_min_px"></span> <span class="hint" data-i18n="btn_min_px_hint"></span></label>
    <input type="number" id="btn_min_px" min="10" max="80" step="1"></div>
-  <div class="row"><label>✕ 胶囊宽度 <span class="hint">DIP（默认 50）</span></label>
+  <div class="row"><label><span data-i18n="btn_close_px"></span> <span class="hint" data-i18n="btn_close_px_hint"></span></label>
    <input type="number" id="btn_close_px" min="10" max="120" step="1"></div>
-  <div class="row"><label>胶囊顶部偏移 <span class="hint">DIP，相对窗口顶部（默认 0）</span></label>
+  <div class="row"><label><span data-i18n="btn_top_px"></span> <span class="hint" data-i18n="btn_top_px_hint"></span></label>
    <input type="number" id="btn_top_px" min="0" max="40" step="1"></div>
-  <div class="row"><label>胶囊高度 <span class="hint">DIP，0 = 整条标签带</span></label>
+  <div class="row"><label><span data-i18n="btn_h_px"></span> <span class="hint" data-i18n="btn_h_px_hint"></span></label>
    <input type="number" id="btn_h_px" min="0" max="120" step="1"></div>
-  <div class="row"><label>挖孔高度修正 <span class="hint">DIP，负值减小（挖孔底部侵入窗口内容区时设为负，如 -3）</span></label>
+  <div class="row"><label><span data-i18n="btn_h_fix_px"></span> <span class="hint" data-i18n="btn_h_fix_px_hint"></span></label>
    <input type="number" id="btn_h_fix_px" min="-40" max="40" step="1"></div>
  </div>
 
- <div class="card off">
-  <h2>外观</h2>
-  <div class="hint" style="margin:0 0 10px">实际配色（玻璃、标题按钮）由 OpenGlass 决定；这里只保留托盘菜单记录的主题标记。</div>
-  <div class="row"><label>主题</label>
-   <select id="theme" disabled><option value="light">浅色</option><option value="dark">深色</option></select></div>
+ <div class="card">
+  <h2 data-i18n="sec_language">语言</h2>
+  <div class="row"><label><span data-i18n="lang"></span> <span class="hint" data-i18n="lang_hint"></span></label>
+   <select id="lang">
+    <option value="auto" data-i18n="lang_auto"></option>
+    <option value="zh" data-i18n="lang_zh"></option>
+    <option value="en" data-i18n="lang_en"></option>
+   </select></div>
  </div>
 
  <div class="card">
-  <h2>守护</h2>
-  <div class="row"><label>开机自启<div class="hint">写入 HKCU\\...\\Run</div></label>
+  <h2 data-i18n="sec_daemon">守护</h2>
+  <div class="row"><label><span data-i18n="autostart"></span><div class="hint" data-i18n="autostart_hint"></div></label>
    <input type="checkbox" id="autostart"></div>
-  <div class="row"><label>设置页端口</label><input type="number" id="port" min="1024" max="65535"></div>
+  <div class="row"><label><span data-i18n="port"></span></label><input type="number" id="port" min="1024" max="65535"></div>
  </div>
 
  <div class="card">
-  <h2>当前接管的窗口</h2>
+  <h2 data-i18n="sec_windows">当前接管的窗口</h2>
   <ul id="windows"><li>—</li></ul>
   <div class="btns">
-   <button id="save">保存并应用</button>
-   <button class="ghost" id="refresh">刷新</button>
-   <button class="danger" id="quit">退出守护进程</button>
+   <button id="save" data-i18n="btn_save">保存并应用</button>
+   <button class="ghost" id="refresh" data-i18n="btn_refresh">刷新</button>
+   <button class="danger" id="quit" data-i18n="btn_quit">退出守护进程</button>
   </div>
  </div>
 </div>
 <div id="toast"></div>
 <script>
-const F=['frame_px','corner_px','gl_buttons','btn_pad_right_px','btn_min_px','btn_close_px','btn_top_px','btn_h_px','btn_h_fix_px','theme','autostart','port'];
-let s={};
+const I18N=__I18N__;
+const F=['frame_px','corner_px','gl_buttons','btn_pad_right_px','btn_min_px','btn_close_px','btn_top_px','btn_h_px','btn_h_fix_px','lang','autostart','port'];
+let setting='__LANG_SETTING__', sysLang='__LANG__', lang='__LANG__', last=null, touched=false;
+function T(k){const d=I18N[lang]||I18N.en;return d[k]!==undefined?d[k]:(I18N.en[k]!==undefined?I18N.en[k]:k);}
+function FMT(k,a){return T(k).replace(/\{(\w+)\}/g,(m,g)=>a[g]!==undefined?a[g]:m);}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function applyI18n(){
+  document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=T(el.dataset.i18n);});
+  document.title=T('page_title');
+  document.documentElement.lang = lang==='zh'?'zh-CN':'en';
+  const sel=document.getElementById('lang'); if(sel) sel.value=setting;
+  paintStatus();
+}
+function paintStatus(){
+  const st=document.getElementById('state'); const ul=document.getElementById('windows');
+  if(!last){st.textContent=T('loading');st.className='pill off';return;}
+  st.textContent = last.paused? T('state_paused') : FMT('state_windows',{n:last.windows.length});
+  st.className='pill'+((last.paused||!last.windows.length)?' off':'');
+  ul.innerHTML = last.windows.length
+    ? last.windows.map(w=>`<li>${esc(w.title||T('no_title'))} <span class="hint">hwnd ${esc(w.hwnd)}</span></li>`).join('')
+    : '<li>—</li>';
+}
 function toast(t){const e=document.getElementById('toast');e.textContent=t;e.classList.add('show');
   setTimeout(()=>e.classList.remove('show'),1600);}
 async function load(fill=true){
-  const r=await fetch('/api/status');const j=await r.json();s=j.settings;
-  if(fill)for(const k of F){const el=document.getElementById(k);if(!el)continue;
+  const r=await fetch('/api/status'); const j=await r.json(); last=j;
+  const s=j.settings||{}; sysLang=j.auto_lang||'en';
+  if(!touched){setting=s.lang||'auto';}
+  lang = setting==='auto'? sysLang : setting;
+  if(fill && !touched) for(const k of F){const el=document.getElementById(k);if(!el)continue;
     if(el.type==='checkbox')el.checked=!!s[k];else el.value=s[k];}
-  const st=document.getElementById('state');
-  st.textContent=j.paused?'已暂停':(j.windows.length+' 个窗口');
-  st.className='pill'+(j.paused||!j.windows.length?' off':'');
-  const ul=document.getElementById('windows');
-  ul.innerHTML=j.windows.length?j.windows.map(w=>`<li>${w.title||'(无标题)'} <span class="hint">hwnd ${w.hwnd}</span></li>`).join(''):'<li>—</li>';
+  applyI18n();
 }
+document.getElementById('lang').onchange=e=>{
+  touched=true; setting=e.target.value; lang = setting==='auto'? sysLang : setting; applyI18n();
+};
 document.getElementById('save').onclick=async()=>{
   const out={};
   for(const k of F){const el=document.getElementById(k);
     out[k]= el.type==='checkbox'?el.checked:(el.type==='number'?Number(el.value):el.value);}
   const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(out)});
-  if(r.ok){toast('已保存，正在重新接管窗口');setTimeout(()=>load(true),1200);}else toast('保存失败');
+  if(r.ok){touched=false;toast(T('toast_saved'));setTimeout(()=>load(true),1200);}else toast(T('toast_fail'));
 };
 document.getElementById('refresh').onclick=()=>load(true);
 document.getElementById('quit').onclick=async()=>{
-  if(!confirm('退出守护进程？所有窗口的玻璃标题栏会恢复成原生样式。'))return;
-  await fetch('/api/quit',{method:'POST'});document.body.innerHTML='<p style="padding:40px">守护进程已退出。</p>';
+  if(!confirm(T('confirm_quit')))return;
+  await fetch('/api/quit',{method:'POST'});
+  document.body.innerHTML='<p style="padding:40px">'+esc(T('quit_done'))+'</p>';
 };
+applyI18n();
+document.documentElement.classList.remove('pending');
 load(true);setInterval(()=>load(false),4000);
 </script></html>
 """
+
+
+def page_html(lang, setting):
+    """Settings page for the effective `lang`; carries both tables so the picker can preview."""
+    return (PAGE.replace("__HTML_LANG__", "zh-CN" if lang == "zh" else "en")
+                .replace("__LANG_SETTING__", setting if setting in i18n.LANGS else "auto")
+                .replace("__LANG__", lang)
+                .replace("__I18N__", json.dumps(i18n.STRINGS, ensure_ascii=False)))
 
 
 def make_handler(daemon):
@@ -777,7 +832,8 @@ def make_handler(daemon):
 
         def do_GET(self):
             if self.path in ("/", "/index.html"):
-                self._send(200, PAGE, "text/html; charset=utf-8")
+                self._send(200, page_html(daemon.lang, daemon.lang_setting),
+                           "text/html; charset=utf-8")
             elif self.path.startswith("/api/status"):
                 self._send(200, json.dumps(daemon.status(), ensure_ascii=False))
             else:

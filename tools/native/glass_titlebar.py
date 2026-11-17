@@ -13,7 +13,7 @@ the drawn capsules into WM_SYSCOMMAND, plus drag / double-click on empty caption
 
 usage
   python glass_titlebar.py --hwnd 0x20FC4
-  python glass_titlebar.py --pid 1072 --theme dark|light
+  python glass_titlebar.py --pid 1072
 Ctrl+C resets the window region and removes the overlay.
 """
 from __future__ import annotations
@@ -126,6 +126,7 @@ class BITMAPINFO(ctypes.Structure):
 
 
 u32.GetWindowLongW.restype = ctypes.c_long
+u32.GetForegroundWindow.restype = wt.HWND
 u32.SetWindowRgn.argtypes = [wt.HWND, wt.HANDLE, wt.BOOL]
 u32.DefWindowProcW.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
 u32.DefWindowProcW.restype = ctypes.c_ssize_t
@@ -289,6 +290,15 @@ class UiaWorker:
 
 
 # ------------------------------------------------------------------ geometry
+def hwnd_int(h):
+    """HWND as a plain int. ctypes simple types (c_void_p) compare by *identity*, not value,
+    so `GetForegroundWindow() == hwnd` is False even for the same window; compare .value
+    instead. Accepts an int, a c_void_p, or None."""
+    if h is None:
+        return 0
+    return h.value if isinstance(h, ctypes.c_void_p) else int(h)
+
+
 def window_rect(h):
     r = RECT(); u32.GetWindowRect(h, ctypes.byref(r))
     return r.left, r.top, r.right, r.bottom
@@ -427,7 +437,7 @@ def force_foreground(h):
     """SetForegroundWindow from a background process needs a thread-input attach."""
     if not h or not u32.IsWindow(h):
         return
-    if u32.GetForegroundWindow() == h:
+    if hwnd_int(u32.GetForegroundWindow()) == hwnd_int(h):
         return
     fg = u32.GetForegroundWindow()
     me = k32.GetCurrentThreadId()
@@ -453,7 +463,6 @@ class Settings:
     """Tunables, read from %APPDATA%\\edge-win7-glass\\settings.json (CLI wins over file)."""
 
     DEFAULTS = {
-        "theme": "light",          # light | dark
         "frame_px": 4,             # CSS px; thin glass frame on all four sides
         "corner_px": 6,            # CSS px; radius of the two top corners of the frame
         "gl_buttons": True,        # hand the top-right corner to OpenGlass caption buttons
@@ -469,6 +478,7 @@ class Settings:
         "btn_h_fix_px": 0,         # DIP; 挖孔高度修正，负值减小（解决挖孔底部侵入窗口内容区）
         "port": 8721,              # local settings page
         "autostart": False,
+        "lang": "auto",            # UI language: "auto" (follow Windows) / "zh" / "en"
     }
 
     _PATH = SETTINGS_PATH
@@ -645,10 +655,32 @@ class TouchOverlay(threading.Thread):
     def _raise_above(self):
         """Keep the overlay directly above the browser window (it must win the hit test)."""
         prev = u32.GetWindow(self.target, 3)      # GW_HWNDPREV
-        if prev == self.hwnd:
+        if hwnd_int(prev) == hwnd_int(self.hwnd):
             return
         u32.SetWindowPos(self.hwnd, prev or 0, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+    def refresh_zorder(self, foreground):
+        """Track the target's Z-order so a foreground window's hole never falls through to a
+        *sibling* window's overlay (multi-window confusion).
+
+        `_raise_above` only runs when the hole geometry changes (`set_area`); switching
+        foreground between two managed windows moves the browser windows in Z-order but not
+        the overlays, so a stale overlay of a background window can sit above the foreground
+        window and eat its caption clicks. Re-fix the overlay's band on every foreground
+        change:
+          * foreground -> HWND_TOP, so it beats any stale sibling overlay;
+          * background -> just above its own target, below the foreground window, so it can
+            still catch a click on a *visible* caption corner (to bring the window forward)
+            without stealing clicks from the window in front.
+        """
+        if not self.hwnd:
+            return
+        if foreground:
+            u32.SetWindowPos(self.hwnd, 0, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        else:
+            self._raise_above()
 
     # -------------------------------------------------- mouse handling
     def _wndproc(self, h, msg, wp, lp):
@@ -733,7 +765,7 @@ class TouchOverlay(threading.Thread):
     def run(self):
         inst = k32.GetModuleHandleW(None)
         wc = WNDCLASS()
-        wc.lpfnWndProc = self._proc
+        wc.lpfnWndProc = _OVERLAY_PROC     # shared by every instance; dispatches by hwnd
         wc.hInstance = inst
         wc.lpszClassName = "GlassTouchOverlay"
         wc.hCursor = u32.LoadCursorW(None, 32512)
@@ -747,6 +779,7 @@ class TouchOverlay(threading.Thread):
             dbg(f"touch create failed {ctypes.GetLastError()}")
             return
         self.hwnd = h
+        _OVERLAYS[hwnd_int(h)] = self
         trace(f"touch overlay created hwnd={h:x}")
         if self.stop_flag:                 # stop() raced ahead of window creation
             u32.DestroyWindow(h)
@@ -761,6 +794,7 @@ class TouchOverlay(threading.Thread):
             u32.TranslateMessage(ctypes.byref(msg))
             u32.DispatchMessageW(ctypes.byref(msg))
         if self.hwnd:
+            _OVERLAYS.pop(hwnd_int(self.hwnd), None)
             u32.DestroyWindow(self.hwnd)
             self.hwnd = None
 
@@ -768,6 +802,23 @@ class TouchOverlay(threading.Thread):
         self.stop_flag = True
         if self.hwnd:
             u32.PostMessageW(self.hwnd, 0x8001, 0, 0)   # WM_APP+1: wake GetMessage so it exits
+
+
+# One window class serves every overlay in the process, and RegisterClassW keeps only the
+# FIRST registration's WndProc. A per-instance bound method therefore made every later
+# overlay run the first instance's handler, so clicks in window B's caption corner moved,
+# minimised or closed window A. Dispatch by overlay hwnd instead.
+_OVERLAYS = {}
+
+
+def _overlay_wndproc(h, msg, wp, lp):
+    ov = _OVERLAYS.get(hwnd_int(h))
+    if ov is None:
+        return u32.DefWindowProcW(h, msg, wp, lp)
+    return ov._wndproc(h, msg, wp, lp)
+
+
+_OVERLAY_PROC = WNDPROC(_overlay_wndproc)
 
 
 
@@ -793,6 +844,7 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
     last_snap = None
     last_snap_t = 0.0
     btn_sig = None
+    was_fg = None
 
     def restore_region():
         """Parent region, plus the D3D child in case an older build left a hole there."""
@@ -818,6 +870,12 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
                 continue
 
             win = window_rect(hwnd)
+            if cap:
+                fg = hwnd_int(u32.GetForegroundWindow()) == hwnd_int(hwnd)
+                if fg != was_fg:
+                    was_fg = fg
+                    cap.refresh_zorder(fg)
+                    trace(f"zorder fg={fg} hwnd={hwnd:x}")
             if cap and cap.busy:
                 # A hand move started by the overlay is in flight: the region is expressed in
                 # window coordinates so it follows the window by itself. Touching it (or
@@ -957,7 +1015,6 @@ def main():
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--hwnd", type=lambda s: int(s, 0))
     g.add_argument("--pid", type=int)
-    ap.add_argument("--theme", choices=("dark", "light"), default=None)
     ap.add_argument("--settings", default=None, help="settings.json path")
     ap.add_argument("--reset", action="store_true", help="only restore the window region and exit")
     ap.add_argument("--scale", type=float, default=0.0)
@@ -977,7 +1034,7 @@ def main():
         print(f"region reset on {hwnd}")
         return 0
 
-    cfg = Settings(a.settings, theme=a.theme)
+    cfg = Settings(a.settings)
     dpi = u32.GetDpiForWindow(hwnd) or 96
     scale = a.scale or dpi / 96.0
     u32.SetWindowRgn(hwnd, None, True)          # clear a hole left behind by a killed run

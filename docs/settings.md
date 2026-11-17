@@ -9,10 +9,10 @@
 {
   "frame_px": 4,
   "gl_buttons": true,
-  "theme": "light",
 
   "port": 8721,
-  "autostart": false
+  "autostart": false,
+  "lang": "auto"
 }
 ```
 
@@ -31,10 +31,7 @@
 | `btn_h_fix_px` | DIP | 挖孔高度修正，负值减小；挖孔底部侵入窗口内容区时设为负（如 −3），默认 0 |
 | `port` | int | 设置页端口，默认 8721（占用时自动 +1） |
 | `autostart` | bool | 开机自启（写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`） |
-
-## `theme`（唯一保留的自绘遗留项）
-
-`light` / `dark`，只驱动托盘菜单里的勾选标记；实际配色（玻璃、标题按钮）由 OpenGlass 管。
+| `lang` | str | 界面语言：`"auto"`（默认，跟随 Windows 显示语言：中文 → zh，其它 → en）/ `"zh"` / `"en"`。影响托盘菜单、托盘提示和设置页；设置页底部“语言”卡片可直接改 |
 
 ## 热应用
 
@@ -44,6 +41,5 @@
 命令行覆盖（仅 `glass_titlebar.py` 单窗口模式）：
 
 ```bash
---theme dark
 --settings <path>      # 换一个配置文件
 ```

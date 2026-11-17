@@ -555,3 +555,32 @@ UIA 里 Chromium 的按钮矩形（46 DIP 宽、右缘距窗口 6 DIP），和 O
 - 待用户真实点击验证：点胶囊 → `touch click -> min|max|close`；拖空白 → 窗口移动；
   双击空白 → 最大化/还原（日志在 `%LOCALAPPDATA%\\edge-win7-glass\\tool-debug.log`）。
 
+
+
+## 13. 多窗口触控识别混乱：覆盖窗 Z 序不跟随前台切换（2026-11-17）
+
+症状：多个浏览器窗口同时被接管时，点当前窗口右上角的胶囊/空白，触发的是**别的窗口**的动作
+（或点击漏到桌面）。
+
+根因：`TouchOverlay._raise_above()` 只在**挖洞几何变化**（`set_area` → `_reposition`）时执行一次，
+把覆盖窗插到 target 正上方。但前台切换只移动浏览器窗口在 Z 序里的位置，**覆盖窗不动**——于是
+后台窗口的覆盖窗会留在前台窗口上面，把前台窗口的 caption 点击吃掉，转发成那个后台窗口的
+`WM_SYSCOMMAND`。
+
+修法（`glass_titlebar.py`）：
+
+1. `TouchOverlay.refresh_zorder(foreground)`：前台 → `SetWindowPos(HWND_TOP)` 顶到最上，盖过任何
+   陈旧的兄弟覆盖窗；后台 → `_raise_above()` 收回到自己 target 正上方（低于前台窗口），仍能接住
+   「可见 caption 角」的点击把窗口带到前台，又不抢前台窗口的点击。
+2. `attach_loop` 每轮对比 `GetForegroundWindow()`，**前台状态变化时**调用 `refresh_zorder`（每窗口
+   各自维护，A 变前台时 A 顶、B 收，反之亦然）。
+3. 顺带修两处潜伏 bug：
+   - `GetForegroundWindow` 没设 restype，默认 `c_int` 把 64 位句柄截断成 32 位；已设 `restype=wt.HWND`。
+   - 句柄判等无效：ctypes 简单类型（`c_void_p`）按**身份**比较、不按值（实测
+     `c_void_p(0x20FC4)==c_void_p(0x20FC4)` → `False`）。新增 `hwnd_int()` 统一转 int 再比，
+     `force_foreground` / `_raise_above` 的判等一并修正。
+   - 实测枚举窗口 / `GetForegroundWindow` 回传的句柄其实是**纯 Python int**（不是 `c_void_p` 实例），
+     所以 `f"{hwnd:x}"` 这类格式化一直没问题；`hwnd_int` 对 int / c_void_p / None 三态都安全。
+
+验证点（用户实测）：开两个浏览器窗口，反复 Alt-Tab / 点击切换前台，然后点当前窗口右上角胶囊，
+应始终命中当前窗口；`tool-debug.log` 每次切换应出现一行 `zorder fg=True|False hwnd=...`。
