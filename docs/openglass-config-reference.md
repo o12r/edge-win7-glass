@@ -1,5 +1,8 @@
 # Configuration and registry reference
 
+> 来源：OpenGlass 官方文档快照（<https://github.com/ALTaleX531/OpenGlass>），
+> 内容与版权归原作者，此处仅作离线参考。
+
 > [!NOTE]
 > These instructions apply to upcoming OpenGlass v3.1.0. In earlier v3 releases, GUI controls and storage behavior differ.
 

@@ -1,9 +1,9 @@
 # FINDINGS — 已做的实验与结论
 
-> 注：本文是实验记录。第一轮用的一次性探针脚本已清理，`tools/` 现在只剩生产链路
-> （`native/glass_titlebar.py`、`native/gt_daemon.py`、`native/launch_scratch.py`、`native/launch.bat`）、
-> 取证脚本（`capmain.ps1`、`shot2.ps1`）和探针源码（`native/ogprobe.cpp` + `native/build.bat`）。
-> 下文提到的其他脚本要复现，请从 git 历史取（提交 `a343f9f` 与 `42fdc0d` 之间）。
+> 注：本文是开发期的实验记录，保留原貌以便追溯结论是怎么得出的。
+> 仓库里现在只有生产链路（`tools/native/glass_titlebar.py`、`gt_daemon.py`、`gt_i18n.py`、`launch.bat`）。
+> 下文提到的探针/取证/截图脚本（`ogprobe.cpp`、`probe_*.py`、`launch_scratch.py`、`capmain.ps1` 等）
+> 已从仓库移除，需要复现请从 git 历史取。
 
 ## 1. 环境盘点（实测）
 
@@ -584,3 +584,24 @@ UIA 里 Chromium 的按钮矩形（46 DIP 宽、右缘距窗口 6 DIP），和 O
 
 验证点（用户实测）：开两个浏览器窗口，反复 Alt-Tab / 点击切换前台，然后点当前窗口右上角胶囊，
 应始终命中当前窗口；`tool-debug.log` 每次切换应出现一行 `zorder fg=True|False hwnd=...`。
+
+## 14. 「保存并应用」不再重启浏览器：设置就地热更新（2026-11-17）
+
+旧实现走过两版，都不该留：
+
+1. `self.cfg = gt.Settings()` + `detach_all()` + `scan()` —— 边拆边建，覆盖窗/挖孔留下陈旧状态
+   （点在了死覆盖窗上、洞没收回）。
+2. 改成「关掉所有浏览器（靠 `--restore-last-session` 还原标签）→ 重启守护进程」—— 干净了，
+   但用户丢会话、丢窗口位置、丢全屏状态，代价太大。
+
+正解：**根本不用拆**。`attach_loop` 每轮（100 ms）都重新读 `cfg` 的每个值，而窗口 region 的
+`key` 里已经包含 `(窗口尺寸, n=frame_px, cr=corner_px, cuts)`，所以只要把新值写进
+`self.cfg.data`，下一轮 3 个稳定采样（≈0.3 s）后 region 就用新参数重画，全程不碰浏览器进程和标签。
+
+为此补的两处：
+
+- `gl_buttons` 原来是「attach 时决定要不要建覆盖窗」，现在**总是建**（隐藏状态：`clear()` →
+  `set_area(None)` → `ShowWindow(SW_HIDE)`），每轮按 `cfg.gl_buttons` 决定是否 `set_area` +
+  `refresh_zorder`。关掉时清空 = 隐藏窗口，点不再被吃掉；挖孔那一刀也不再进 `cuts`。
+- 删掉 `restart_everything` / `relaunch_daemon` 与已无用的 `process_path` / `process_user_data_dir`。
+  只有 `port` 变了才就地 `start_http()` 重绑（不影响浏览器）。

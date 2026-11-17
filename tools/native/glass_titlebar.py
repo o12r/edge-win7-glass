@@ -463,8 +463,8 @@ class Settings:
     """Tunables, read from %APPDATA%\\edge-win7-glass\\settings.json (CLI wins over file)."""
 
     DEFAULTS = {
-        "frame_px": 4,             # CSS px; thin glass frame on all four sides
-        "corner_px": 6,            # CSS px; radius of the two top corners of the frame
+        "frame_px": 5,             # CSS px; thin glass frame on all four sides
+        "corner_px": 10,           # CSS px; radius of the two top corners of the frame
         "gl_buttons": True,        # hand the top-right corner to OpenGlass caption buttons
         # OpenGlass CaptionButtons=2 draws *Windows 7* metrics; Chromium's own buttons are
         # 46 DIP wide with a different right margin, so hit-testing the UIA rects makes a
@@ -474,11 +474,11 @@ class Settings:
         "btn_min_px": 30,          # DIP; width of the minimise AND maximise capsule
         "btn_close_px": 50,        # DIP; width of the close capsule
         "btn_top_px": 0,           # DIP; capsule top relative to the window top
-        "btn_h_px": 0,             # DIP; capsule height, 0 = the whole tab band
-        "btn_h_fix_px": 0,         # DIP; 挖孔高度修正，负值减小（解决挖孔底部侵入窗口内容区）
+        "btn_h_px": 20,            # DIP; capsule height, 0 = the whole tab band
+        "btn_h_fix_px": -1,        # DIP; 挖孔高度修正，负值减小（解决挖孔底部侵入窗口内容区）
         "port": 8721,              # local settings page
         "autostart": False,
-        "lang": "auto",            # UI language: "auto" (follow Windows) / "zh" / "en"
+        "lang": "zh",              # UI language: "auto" (follow Windows) / "zh" / "en"
     }
 
     _PATH = SETTINGS_PATH
@@ -834,9 +834,12 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
     """
     worker = UiaWorker(hwnd)
     worker.start()
-    cap = TouchOverlay(hwnd) if cfg.gl_buttons else None
-    if cap:
-        cap.start()
+    # The overlay is always created and hidden until it has an area: gl_buttons is a settings
+    # value that can be switched at runtime, and a per-window overlay cannot be created from
+    # inside the settings page's request. Toggling gl_buttons off just clears the area, which
+    # hides the layered window (nothing left to eat the caption clicks).
+    cap = TouchOverlay(hwnd)
+    cap.start()
 
     applied = None
     pending = None
@@ -870,13 +873,14 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
                 continue
 
             win = window_rect(hwnd)
-            if cap:
+            gl = bool(cfg.gl_buttons)
+            if cap and gl:
                 fg = hwnd_int(u32.GetForegroundWindow()) == hwnd_int(hwnd)
                 if fg != was_fg:
                     was_fg = fg
                     cap.refresh_zorder(fg)
                     trace(f"zorder fg={fg} hwnd={hwnd:x}")
-            if cap and cap.busy:
+            if cap and gl and cap.busy:
                 # A hand move started by the overlay is in flight: the region is expressed in
                 # window coordinates so it follows the window by itself. Touching it (or
                 # re-reading UIA, which still reports the old rect) is what made the hole blink
@@ -930,10 +934,14 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
             # Tab bodies are never touched.
             n = max(1, int(round(cfg.frame_px * scale)))
             cr = max(0, int(round(cfg.corner_px * scale)))
+            # gl_buttons switched off at runtime: hide the overlay, and the cut below simply
+            # stops being added, so the next region apply restores Chromium's own buttons.
+            if cap and not gl:
+                cap.clear()
             # The frame itself comes from insetting the region (frame_region); only the
             # OpenGlass caption corner is subtracted on top of it.
             cuts = []
-            if cfg.gl_buttons and snap.band:
+            if gl and snap.band:
                 # Two geometries have to agree: the hole (what OpenGlass paints in) starts
                 # at the right of the native `+` -- that area is empty strip background and
                 # the `+` keeps its own hit-testing -- while the Win7 capsules OpenGlass

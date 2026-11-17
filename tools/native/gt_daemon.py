@@ -42,6 +42,10 @@ os.makedirs(APP_DATA, exist_ok=True)
 LOG_PATH = os.path.join(APP_DATA, "daemon.log")
 MUTEX = "Local\\edge-win7-glass-daemon"
 
+APP_NAME = "Edge Win7 Glass"
+APP_VERSION = "1.0.0"
+FROZEN = bool(getattr(sys, "frozen", False))   # PyInstaller one-file build (release)
+
 BROWSERS = {"msedge.exe", "chrome.exe", "brave.exe", "vivaldi.exe",
             "chromium.exe", "opera.exe", "yandex.exe", "thorium.exe"}
 WM_TRAY, WM_RELOAD = 0x8001, 0x8002
@@ -123,40 +127,6 @@ def process_exe(hwnd):
     return ""
 
 
-def process_path(hwnd):
-    """Full executable path of the process that owns `hwnd` (to relaunch it later)."""
-    pid = wt.DWORD()
-    u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    h = k32.OpenProcess(0x1000, False, pid)         # PROCESS_QUERY_LIMITED_INFORMATION
-    if not h:
-        return ""
-    try:
-        buf = ctypes.create_unicode_buffer(1024)
-        size = wt.DWORD(1024)
-        if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
-            return buf.value
-    finally:
-        k32.CloseHandle(h)
-    return ""
-
-
-def process_user_data_dir(hwnd):
-    """`--user-data-dir` value of the process owning `hwnd`, or None (default profile)."""
-    pid = wt.DWORD()
-    u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    try:
-        r = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command",
-             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid.value}').CommandLine"],
-            capture_output=True, text=True, timeout=8)
-        m = re.search(r"--user-data-dir=([\"']?)([^\"' ]+)", r.stdout)
-        if m:
-            return m.group(2)
-    except Exception:
-        pass
-    return None
-
-
 def window_class(h):
     b = ctypes.create_unicode_buffer(256)
     u32.GetClassNameW(h, b, 256)
@@ -192,6 +162,8 @@ def browser_windows():
 
 
 def autostart_cmd():
+    if FROZEN:
+        return f'"{sys.executable}"'          # the one-file exe *is* the daemon
     exe = sys.executable.replace("python.exe", "pythonw.exe")
     return f'"{exe}" "{os.path.abspath(__file__)}"'
 
@@ -285,7 +257,8 @@ class Tray:
         nid.uID = 1
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         nid.uCallbackMessage = WM_TRAY
-        nid.hIcon = u32.LoadIconW(None, 32512)          # IDI_APPLICATION
+        # Icon #1 is the one pyinstaller embeds with --icon; fall back to the generic app icon.
+        nid.hIcon = u32.LoadIconW(inst, 1) or u32.LoadIconW(None, 32512)   # IDI_APPLICATION
         nid.szTip = "Edge Win7 Glass"
         shell32.Shell_NotifyIconW(0, ctypes.byref(nid))  # NIM_ADD
         self.data = nid
@@ -451,62 +424,22 @@ class Daemon:
             json.dump(data, f, indent=2, ensure_ascii=False)
         if "autostart" in new:
             set_autostart(bool(new["autostart"]))
+        old_port = int(self.cfg.port)
+        # LIVE APPLY. Every attach loop re-reads cfg once per iteration (frame_px, corner_px,
+        # gl_buttons, btn_* ...) and re-applies the window region whenever the numbers change,
+        # so an in-place data update is all it takes: no detach, no daemon relaunch, and the
+        # browser keeps running with all its tabs. The old detach+re-attach and close+reopen
+        # paths are gone on purpose -- they left stale overlays/holes behind and cost the user
+        # their session.
+        with self.lock:
+            self.cfg.data.update(data)
         if "lang" in new:
             self.lang_setting = new["lang"] if new["lang"] in i18n.LANGS else "auto"
             self.lang = i18n.resolve(self.lang_setting)
-        self.cfg.data.update(data)
-        log(f"settings saved: {new}")
-        # Hot-reconnect (detach + re-attach) leaves stale overlay/region state behind, so
-        # applying settings now does a clean restart: close the browsers (saving their
-        # session), relaunch the daemon, and reopen the browsers with their tabs restored.
-        # Delayed so the HTTP "ok" response reaches the settings page before os._exit kills us.
-        threading.Timer(0.5, self.restart_everything).start()
-
-    def restart_everything(self):
-        """Clean restart: close browsers (saving session), relaunch daemon, reopen browsers.
-
-        Replaces the old detach+re-attach, which left the touch overlay / window region in a
-        stale state (clicks landing on a dead overlay, a hole that stayed cut). A full process
-        restart starts from a clean slate.
-        """
-        self.stopping = True            # the watcher must not re-attach while we tear down
-        # Collect the browsers we manage (before detach_all clears `attached`), so GT_ONLY_HWND
-        # restarts only that window's browser and never touches unrelated browser windows.
-        paths = []
-        seen = set()
-        for h in list(self.attached.keys()):
-            p = process_path(h)
-            if not p or p in seen:
-                continue
-            seen.add(p)
-            paths.append([p, process_user_data_dir(h)])
-        self.detach_all()
-        restore = os.path.join(APP_DATA, "restore.json")
-        try:
-            with open(restore, "w", encoding="utf-8") as f:
-                json.dump(paths, f)
-        except OSError:
-            pass
-        log(f"closing {len(paths)} browser(s) for restart")
-        exes = {p[0] for p in paths}
-        # Graceful close (WM_CLOSE) so Chromium saves the session; --restore-last-session
-        # needs the session file written on exit. Close every window of the target browsers.
-        for h in browser_windows():
-            if process_path(h) in exes:
-                u32.PostMessageW(h, 0x0010, 0, 0)      # WM_CLOSE
-        for _ in range(40):                            # wait for the windows to close
-            if not any(process_path(h) in exes for h in browser_windows()):
-                break
-            time.sleep(0.1)
-        time.sleep(2.0)                                # let the process finish writing its session
-        self.relaunch_daemon()
-
-    def relaunch_daemon(self):
-        exe = sys.executable.replace("python.exe", "pythonw.exe")
-        cmd = f'"{exe}" "{os.path.abspath(__file__)}"'
-        subprocess.Popen(cmd, shell=True)
-        log("daemon relaunched; exiting")
-        os._exit(0)
+        log(f"settings saved (live): {new}")
+        if int(self.cfg.port) != old_port:
+            self.start_http()              # the settings port is the one thing that needs a rebind
+        self.refresh_tip()
 
     def restore_browsers(self):
         """Reopen the browsers we closed, restoring their last session (tabs)."""
@@ -595,8 +528,10 @@ class Daemon:
                 pass
             return 0
         self._mutex = mutex
-        set_autostart(bool(self.cfg.autostart))
-        self.restore_browsers()         # reopen browsers closed by a settings restart
+        # The installer can pre-set the Run key: never delete it just because settings.json
+        # still says autostart=false on first launch.
+        set_autostart(bool(self.cfg.autostart) or autostart_state())
+        self.restore_browsers()         # only clears a restore.json left by an older build
         self.start_http()
         threading.Thread(target=self._watcher, name="watcher", daemon=True).start()
         self.tray = Tray(self)
@@ -795,7 +730,7 @@ document.getElementById('save').onclick=async()=>{
   for(const k of F){const el=document.getElementById(k);
     out[k]= el.type==='checkbox'?el.checked:(el.type==='number'?Number(el.value):el.value);}
   const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(out)});
-  if(r.ok){touched=false;toast(T('toast_saved'));setTimeout(()=>load(true),1200);}else toast(T('toast_fail'));
+  if(r.ok){touched=false;toast(T('toast_saved'));setTimeout(()=>load(true),600);}else toast(T('toast_fail'));
 };
 document.getElementById('refresh').onclick=()=>load(true);
 document.getElementById('quit').onclick=async()=>{
