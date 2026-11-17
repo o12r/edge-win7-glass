@@ -707,19 +707,10 @@ PAGE = r"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
  </div>
 
  <div class="card off">
-  <h2>自绘标签（已停用）</h2>
-  <div class="hint" style="margin:0 0 10px">现在用 Chromium 自己的标签条，图标/关闭/拖拽重排都是原生的。以下参数只对停用的自绘模式有效，保留是为了对照。</div>
+  <h2>外观</h2>
+  <div class="hint" style="margin:0 0 10px">实际配色（玻璃、标题按钮）由 OpenGlass 决定；这里只保留托盘菜单记录的主题标记。</div>
   <div class="row"><label>主题</label>
    <select id="theme" disabled><option value="light">浅色</option><option value="dark">深色</option></select></div>
-  <div class="row"><label>标签最大宽度</label>
-   <input type="number" id="tab_max_width" min="80" max="400" step="10" disabled></div>
-  <div class="row"><label>标签最小宽度</label>
-   <input type="number" id="tab_min_width" min="30" max="200" step="5" disabled></div>
-  <div class="row"><label>标签圆角</label>
-   <input type="number" id="tab_radius" min="0" max="16" step="1" disabled></div>
-  <div class="row"><label>悬停高亮</label><input type="checkbox" id="hover" disabled></div>
-  <div class="row"><label>抓取 favicon</label><input type="checkbox" id="favicons" disabled></div>
-  <div class="row"><label>滚轮切标签</label><input type="checkbox" id="wheel_tabs" disabled></div>
  </div>
 
  <div class="card">
@@ -741,7 +732,7 @@ PAGE = r"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 </div>
 <div id="toast"></div>
 <script>
-const F=['frame_px','corner_px','gl_buttons','btn_pad_right_px','btn_min_px','btn_close_px','btn_top_px','btn_h_px','btn_h_fix_px','theme','tab_max_width','tab_min_width','tab_radius','hover','favicons','wheel_tabs','autostart','port'];
+const F=['frame_px','corner_px','gl_buttons','btn_pad_right_px','btn_min_px','btn_close_px','btn_top_px','btn_h_px','btn_h_fix_px','theme','autostart','port'];
 let s={};
 function toast(t){const e=document.getElementById('toast');e.textContent=t;e.classList.add('show');
   setTimeout(()=>e.classList.remove('show'),1600);}

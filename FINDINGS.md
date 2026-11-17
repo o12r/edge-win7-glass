@@ -331,11 +331,12 @@ B comb     缝隙 85,87,92    tab0 本体 49,137,146   ← 本体逐像素不变
 
 实现要点：
 
-- `NATIVE_TABS = True` 是总开关；自绘那套（`layout_tabs`/`render`/`Overlay`/`Favicons`/
-  `InputHook` 的标签分支）**保留但不接线**，只作实验记录。
 - 原生模式下不建覆盖层、不装鼠标钩子（滚轮切标签、双击最大化本来就是 Chromium 的行为）。
 - region 的 key 里带 tab 矩形，并按 2px 对齐：UIA 会抖 1px，无谓的 `SetWindowRgn`
   会让标签条闪。
+- **后续清理**：自绘那套（`layout_tabs`/`render`/`Overlay`/`Favicons`/`Theme`/`comb_region`/
+  `clip_region`/`child_cut_region`）已连同 `NATIVE_TABS` 开关和对应设置项整段删除，
+  只留原生路径；`theme` 仍保留但只驱动托盘菜单勾选。
 ### 11.3 最终形态：四边窄边 + 右上角交给 OpenGlass
 
 用户方向调整：**保留 Chromium 原生标签条**（自绘 favicon 兼容性差），玻璃只做边框。
@@ -352,10 +353,10 @@ B comb     缝隙 85,87,92    tab0 本体 49,137,146   ← 本体逐像素不变
 角里的空白处也一并吃掉，避免误点桌面。实测：点最小化 `iconic=True`，点最大化 `zoomed=True`，
 日志 `caption click -> min/max`。
 
-`comb_region()`（只挖标签条背景、保留 tab 矩形）作为中间方案留在代码里但不再接线。
+`comb_region()`（只挖标签条背景、保留 tab 矩形）当年作为中间方案留在代码里，现已删除。
 
-设置页已改：`frame_px`、`gl_buttons` 是生效项；主题/标签宽度/圆角/悬停/favicon/滚轮
-归到「自绘标签（已停用）」卡片，置灰保留。
+设置页已改：`frame_px`、`gl_buttons` 等是生效项；自绘专用的标签宽度/圆角/悬停/favicon/滚轮
+输入框已从页面和 `F` 列表里去掉。
 
 ### 11.4 交互补齐：全屏、挖洞处的选中与缩放
 

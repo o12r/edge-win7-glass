@@ -1,7 +1,7 @@
 # 现状交接（新会话从这里开始）
 
 > 上次更新时间点：**方向已改为「原生标签 + 四边窄玻璃边框」**，右上角按钮交给 OpenGlass。
-> 自绘标签那套保留但不再接线。细节见 `FINDINGS.md` 第 11 节。
+> 自绘标签那套（`layout_tabs`/`render`/`Overlay`/`Favicons`/`Theme`）已**整段删除**，不再保留开关。
 
 ## 一句话现状
 
@@ -44,17 +44,12 @@ cd /c/Users/oscar/Projects/edge-win7-glass
 .venv/Scripts/python.exe tools/native/glass_titlebar.py --hwnd 0x... --theme dark|light
 
 # 常用开关
---tab-max-width 180      # 标签宽度上限（CSS px，默认 220）
---no-hover               # 关悬停高亮
---no-favicons            # 不抓真实图标（退回小圆点）
 --settings <path>        # 换配置文件，默认 %APPDATA%\edge-win7-glass\settings.json
 
 # 只还原窗口形状（进程被 kill 后洞会残留，用这个清）
 .venv/Scripts/python.exe tools/native/glass_titlebar.py --hwnd <hwnd> --reset
 
-# 调试日志 / 位图转储
-GLASS_TITLEBAR_DEBUG=1            # → %TEMP%\glass_titlebar_debug.log
-GLASS_TITLEBAR_DUMP=1             # → %TEMP%\gt_last.png（实际送进 UpdateLayeredWindow 的位图）
+# 调试日志（GLASS_TITLEBAR_DEBUG=1 时写 %LOCALAPPDATA%\edge-win7-glass\tool-debug.log）
 ```
 
 临时 profile 用来试验，不动用户的 Edge：
@@ -91,17 +86,14 @@ GLASS_TITLEBAR_DUMP=1             # → %TEMP%\gt_last.png（实际送进 Update
   - `Settings` — `%APPDATA%\edge-win7-glass\settings.json`；CLI 覆盖文件。
   - `UiaWorker` — 独立线程 + 独立 COM STA，每 0.2s 采一次 tabs（名字/矩形/选中态）、
     `Minimize/Maximize/Close/New Tab/Search tabs` 矩形；3s 没新样本就丢线程重启。
-  - `layout_tabs()` — Win7 式等宽布局（上限/下限/左对齐），绘制与命中表共用。
-  - `clip_region()` — 按 band 生成「去掉顶部一条」的 region。
-  - `Favicons` — `freeze` + 清 region + `PrintWindow(D3D 子窗)` + 回填 region，
-    按 `_stable(title)` 缓存；`key_icon()` 做背景键控 + 按主题给字形染色。
-  - `Theme` / `render()` / `vgrad()` — Pillow 合成 RGBA（渐变条 + 圆角遮罩有缓存）。
-  - `Overlay` — `UpdateLayeredWindow` 的 per-pixel alpha 窗口（自绘模式用，已停用未接线）。
+    原生模式下 tabs 只用来算标签带高度，按钮矩形只用来决定挖孔左边界。
+  - `frame_region()` / `round_corner_cut()` — 四边内缩圆角矩形减去右上角挖口。
+  - `win7_caption_buttons()` — OpenGlass 在洞里画的 Win7 胶囊指标（挖孔与命中同一源）。
   - `TouchOverlay` — 隐形分层窗口（alpha=1），盖在挖洞 rect 上，自己的消息循环收鼠标：
     胶囊点击 → `WM_SYSCOMMAND`、空白拖动/双击最大化、洞内点击 → 前台；`SetCapture` 保证
     拖动不丢（FINDINGS §12）。四边 resize 不做。
   - `attach_loop()` — 单窗口主循环：快照 → 校验（全屏/陈旧矩形就清洞）→ 设 region →
-    驱动 `TouchOverlay.set_area` → 节流重绘。CLI（`main()`）和守护进程共用。
+    驱动 `TouchOverlay.set_area`。CLI（`main()`）和守护进程共用。
 
 ## 已知限制 / 下一步可做
 
@@ -123,13 +115,11 @@ GLASS_TITLEBAR_DUMP=1             # → %TEMP%\gt_last.png（实际送进 Update
 9. **守护进程必须单实例**：两个同时跑会互相吃掉 `LBUTTONUP`，残留的 `moving/resizing` 用旧矩形
    反复 `SetWindowPos`，表现就是窗口"高频率强制复位"。单实例检查用 `k32.GetLastError()`
    （`ctypes.GetLastError()` 对 `windll` 永远是 0）。
-10. 自绘模式若要复活：`NATIVE_TABS = False` 即可切回（代码保留在文件里，见
-    `FINDINGS` §11.1 关于「双层标签」的成因，别再踩）。
 
 ## 相关文件
 
 - `tools/native/glass_titlebar.py` — 当前主工具（`frame_region` + 原生标签 + `TouchOverlay`；
-  自绘那套 `layout_tabs`/`render`/`Overlay`/`Favicons` 仍在文件里但未接线）
+  自绘标签代码已删除）
 - `tools/native/gt_daemon.py` — 守护进程 + 托盘 + 设置页
 - `tools/native/launch.bat` — 无控制台启动守护进程
 - `tools/native/launch_scratch.py` — 临时 profile 启动器

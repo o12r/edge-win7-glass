@@ -1,18 +1,15 @@
 """
-glass_titlebar.py - replace a Chromium browser's self-drawn title bar with a real glass bar.
+glass_titlebar.py - thin glass frame around a Chromium browser window.
 
-The whole title bar strip (tabs + window buttons) is cut out of the window with SetWindowRgn,
-which exposes the Aero/OpenGlass glass that DWM already renders behind it. A layered overlay
-window then redraws the tabs, the new-tab button and the window buttons on top of that glass.
+A thin strip on all four sides is cut out of the window with SetWindowRgn, which exposes the
+Aero/OpenGlass glass DWM already renders behind it, and the top-right corner (from the native
+`+` to the window edge) is cut out as well so OpenGlass can paint Win7 caption capsules there.
+The tab strip itself is Chromium's own and is never touched: favicons, close buttons,
+hit-testing and drag-reorder all stay native.
 
-Tab text/state/rects and the button rects come from UI Automation, so the redrawn bar follows
-tab open/close/selection and window resizes.
-
-This tool is VISUAL ONLY: it never installs a mouse hook, never swallows a click and never
-moves or resizes the window itself. Everything the browser owns (tab strip, its own caption
-buttons, dragging, resizing, keyboard) stays 100% native. The one exception is documented
-elsewhere: the OpenGlass caption corner is a region hole, so a click there lands on whatever
-is behind the browser (the desktop) instead of on a button.
+A UIA worker only supplies the tab band rectangle (and the native button rects used to size the
+hole); an invisible layered window (TouchOverlay) covers the holed corner and turns clicks on
+the drawn capsules into WM_SYSCOMMAND, plus drag / double-click on empty caption.
 
 usage
   python glass_titlebar.py --hwnd 0x20FC4
@@ -151,8 +148,6 @@ gdi.CreateDIBSection.argtypes = [wt.HDC, ctypes.POINTER(BITMAPINFO), wt.UINT,
 
 WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wt.HWND, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t)
 
-HTTRANSPARENT = -1
-
 
 class WNDCLASS(ctypes.Structure):
     _fields_ = [("style", ctypes.c_uint), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
@@ -165,7 +160,6 @@ class WNDCLASS(ctypes.Structure):
 TAB = UIA.UIA_TabItemControlTypeId
 BTN = UIA.UIA_ButtonControlTypeId
 SEL = UIA.UIA_SelectionItemPatternId
-INV = UIA.UIA_InvokePatternId
 
 
 def element_rect(el):

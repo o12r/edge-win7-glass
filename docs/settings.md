@@ -3,20 +3,13 @@
 `glass_titlebar.py` reads `%APPDATA%\edge-win7-glass\settings.json` (CLI flags override it).
 
 当前形态：**Chromium 原生标签条 + 四边窄玻璃边框**，右上角交给 OpenGlass 画 Win7 按钮。
-自绘标签那一套（主题/宽度/圆角/悬停/favicon/滚轮）已停用，参数保留只为对照。
+自绘标签那套（宽度/圆角/悬停/favicon/滚轮/双色渐变）已从代码里删除。
 
 ```json
 {
   "frame_px": 4,
   "gl_buttons": true,
-
   "theme": "light",
-  "tab_max_width": 220,
-  "tab_min_width": 70,
-  "tab_radius": 6,
-  "hover": true,
-  "favicons": true,
-  "wheel_tabs": true,
 
   "port": 8721,
   "autostart": false
@@ -39,16 +32,9 @@
 | `port` | int | 设置页端口，默认 8721（占用时自动 +1） |
 | `autostart` | bool | 开机自启（写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`） |
 
-## 已停用（自绘标签模式，保留对照）
+## `theme`（唯一保留的自绘遗留项）
 
-| key | 说明 |
-|---|---|
-| `theme` | `light` / `dark`，活动标签明暗 |
-| `tab_max_width` / `tab_min_width` | 自绘标签宽度上下限（CSS px） |
-| `tab_radius` | 自绘标签顶部圆角 |
-| `hover` | 自绘悬停高亮 |
-| `favicons` | 抓原生条像素画图标（兼容性差，正是停用原因） |
-| `wheel_tabs` | 标题栏滚轮 = Ctrl+Tab（原生模式里 Chromium 自己就支持） |
+`light` / `dark`，只驱动托盘菜单里的勾选标记；实际配色（玻璃、标题按钮）由 OpenGlass 管。
 
 ## 热应用
 
@@ -59,8 +45,5 @@
 
 ```bash
 --theme dark
---tab-max-width 180
---no-hover
---no-favicons
 --settings <path>      # 换一个配置文件
 ```
