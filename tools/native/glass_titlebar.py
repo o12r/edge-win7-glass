@@ -132,6 +132,7 @@ u32.DefWindowProcW.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
 u32.DefWindowProcW.restype = ctypes.c_ssize_t
 gdi.CreateRectRgn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
 gdi.CreateRectRgn.restype = wt.HANDLE
+gdi.OffsetRgn.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_int]
 gdi.CombineRgn.argtypes = [wt.HANDLE, wt.HANDLE, wt.HANDLE, ctypes.c_int]
 gdi.DeleteObject.argtypes = [wt.HANDLE]
 gdi.DeleteDC.argtypes = [wt.HDC]
@@ -325,8 +326,14 @@ def is_fullscreen(hwnd, win):
     Fullscreen must be left completely alone -- Chromium shows/hides its tab strip there as the
     cursor nears the top, and cutting a hole for that (or clearing it again) makes the region
     flicker. Maximized windows stay *outside* monitor bounds, so this does not catch them.
+
+    F11 entered from a *maximized* window keeps WS_MAXIMIZE (IsZoomed stays True) and only
+    drops WS_CAPTION / WS_THICKFRAME, so a zoomed window still counts as fullscreen when its
+    caption style is gone.
     """
-    if u32.IsZoomed(hwnd):
+    WS_CAPTION = 0x00C00000
+    style = u32.GetWindowLongW(hwnd, -16) & 0xFFFFFFFF          # GWL_STYLE
+    if u32.IsZoomed(hwnd) and (style & WS_CAPTION) == WS_CAPTION:
         return False
     MONITORINFO = type("MONITORINFO", (ctypes.Structure,), {
         "_fields_": [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
@@ -848,6 +855,8 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
     last_snap_t = 0.0
     btn_sig = None
     was_fg = None
+    was_fs = False
+    reapply_at = []          # timestamps for forced re-applies after leaving fullscreen
 
     def restore_region():
         """Parent region, plus the D3D child in case an older build left a hole there."""
@@ -888,6 +897,9 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
                 time.sleep(0.05)
                 continue
             if is_fullscreen(hwnd, win):
+                if not was_fs:
+                    was_fs = True
+                    trace(f"fullscreen enter {hwnd:x} win={win}")
                 if applied:
                     restore_region()
                     applied = None
@@ -898,6 +910,14 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
                     cap.clear()
                 time.sleep(0.25)
                 continue
+            if was_fs:
+                was_fs = False
+                # Chromium keeps restyling the frame for a while after F11 ends and each pass
+                # wipes the region again, so re-apply a few times over ~1.5 s.
+                t0 = time.time()
+                reapply_at = [t0, t0 + 0.3, t0 + 0.7, t0 + 1.5]
+                pending, pend_n = None, 0
+                trace(f"fullscreen leave {hwnd:x} win={win}")
             snap = worker.latest()
             if not snap or not snap.band or snap.win != win:
                 # A hand-drag moves the window every few ms, so the UIA snapshot is always one
@@ -914,7 +934,8 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
                     # window still has the size we last applied the region for, the region is
                     # still correct (it lives in window coordinates). Only a real state
                     # change (minimised, fullscreen, resize) may open the native frame.
-                    if applied and (win[2] - win[0], win[3] - win[1]) == applied[0]:
+                    if (applied and (win[2] - win[0], win[3] - win[1]) == applied[0]
+                            and not reapply_at):
                         time.sleep(0.1)
                         continue
                     if applied:
@@ -987,6 +1008,16 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
             rel = tuple((c[0] - win[0], c[1] - win[1], c[2] - win[0], c[3] - win[1])
                         for c in cuts)
             key = ((win[2] - win[0], win[3] - win[1]), n, cr, rel)
+            # Leaving F11 restyles the window and Chromium drops the region on its own, while
+            # the key (same size as before fullscreen) is unchanged: force one apply now.
+            # GetWindowRgn cannot be used to detect this -- on a maximized Chromium window it
+            # always reports no region, which made a polling check re-apply every loop.
+            lost = bool(reapply_at) and time.time() >= reapply_at[0]
+            if lost:
+                while reapply_at and time.time() >= reapply_at[0]:
+                    reapply_at.pop(0)
+                trace(f"post-fullscreen re-apply {hwnd:x} left={len(reapply_at)}")
+                applied = None
             if applied != key:
                 # A size change must be applied at once; a band appearing/disappearing has to
                 # be stable for 3 samples first, otherwise UIA flicker in fullscreen / during
@@ -994,7 +1025,7 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
                 size_changed = applied is not None and applied[0] != key[0]
                 pend_n = pend_n + 1 if pending == key else 1
                 pending = key
-                if size_changed or pend_n >= 3:
+                if size_changed or lost or pend_n >= 3:
                     # Edge's visible content starts at its client left edge (the window rect
                     # has an invisible resize border), so the left arc must start there or
                     # the content clips it into a flat ellipse.
@@ -1003,6 +1034,18 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
                     rgn = frame_region(win, cuts, n, cr, max(0, pt.x - win[0]))
                     if rgn:
                         u32.SetWindowRgn(hwnd, rgn, True)
+                    # After F11 the parent's region no longer clips Chromium's D3D child (the
+                    # child keeps painting its own caption over the hole, measured: parent-only
+                    # hole = native bar, parent+child hole = glass again). Give the child the
+                    # same shape, shifted into its own coordinates; before F11 this is
+                    # pixel-identical to the parent cut alone, so it is always applied.
+                    child = d3d_child(hwnd)
+                    if child and u32.IsWindow(child):
+                        crgn = frame_region(win, cuts, n, cr, max(0, pt.x - win[0]))
+                        if crgn:
+                            kr = window_rect(child)
+                            gdi.OffsetRgn(crgn, win[0] - kr[0], win[1] - kr[1])
+                            u32.SetWindowRgn(child, crgn, True)
                     applied = key
                     trace(f"apply region win={win} cuts={len(cuts)} n={n} r={cr}")
                     pending, pend_n = None, 0
