@@ -55,7 +55,7 @@ if errorlevel 1 echo       (快捷方式创建失败，可手动拖拽 %DEST%\%E
 
 echo [4/5] 注册卸载信息...
 reg add "%UNKEY%" /v DisplayName    /t REG_SZ /d "%APPNAME%" /f >nul
-reg add "%UNKEY%" /v DisplayVersion /t REG_SZ /d "1.1.0" /f >nul
+reg add "%UNKEY%" /v DisplayVersion /t REG_SZ /d "1.1.1" /f >nul
 reg add "%UNKEY%" /v Publisher      /t REG_SZ /d "Edge Win7 Glass" /f >nul
 reg add "%UNKEY%" /v DisplayIcon    /t REG_SZ /d "%DEST%\%EXENAME%" /f >nul
 reg add "%UNKEY%" /v InstallLocation /t REG_SZ /d "%DEST%" /f >nul

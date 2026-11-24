@@ -40,7 +40,7 @@
 - **安装到系统**（开始菜单 + 桌面快捷方式 + 卸载项 + 开机自启）：双击 `release\install.bat`；
 - **不安装**：直接双击 `release\EdgeWin7Glass.exe` 常驻运行。
 
-也可以到 [Releases](../../releases) 下载打包好的 `EdgeWin7Glass-1.1.0.zip`（内容与 `release/` 相同）。
+也可以到 [Releases](../../releases) 下载打包好的 `EdgeWin7Glass-1.1.1.zip`（内容与 `release/` 相同）。
 
 - 安装位置：`%LOCALAPPDATA%\Programs\EdgeWin7Glass`（**不需要管理员**）；`install.bat /noautostart` 可跳过开机自启；
 - **卸载**：设置 → 应用 → 已安装的应用 → *Edge Win7 Glass*，或双击 `release\uninstall.bat`
@@ -67,7 +67,8 @@ tools\native\launch.bat                                        # 同上（用项
   `msedge / chrome / brave / vivaldi / chromium / opera / yandex / thorium`。
 - 托盘图标：左键 = 打开设置页；右键 = 版本号 / 设置页 / 暂停接管 / 开机自启 / 响应速度 / 重启 / 退出。
 - 响应速度（托盘右键子菜单，即时生效，写入 `settings.json` 的 `speed`）：省电（CPU 最低）/ 均衡 / 极速（默认，响应最快）。
-  实测空闲 2 个窗口时约占单核 15% / 22% / 30%，内存约 60 MB。
+  自动降频：窗口布局 1.5 秒没变化且你没在该窗口操作时，轮询慢 4 倍，一有动静立即恢复（`settings.json` 的 `auto_idle` 可关）。
+  实测空闲 2 个窗口约占单核 5% / 9% / 14%（省电 / 均衡 / 极速），内存约 65 MB。
 - 设置页 <http://127.0.0.1:8721/>（端口被占用自动 +1），改完点「保存并应用」**即时生效**，
   不重启浏览器、不动标签页。
 - 托盘「退出」会还原所有窗口形状；用任务管理器强杀会留下挖孔，重开一次或
@@ -151,7 +152,7 @@ requirements.txt      运行时依赖（comtypes）
 
 ```bash
 cp dist/EdgeWin7Glass.exe release/
-cd release && "/c/Program Files/7-Zip/7z.exe" a -tzip ../dist/EdgeWin7Glass-1.1.0.zip \
+cd release && "/c/Program Files/7-Zip/7z.exe" a -tzip ../dist/EdgeWin7Glass-1.1.1.zip \
     EdgeWin7Glass.exe install.bat uninstall.bat README.txt settings.md
 ```
 

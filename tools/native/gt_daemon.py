@@ -43,7 +43,7 @@ LOG_PATH = os.path.join(APP_DATA, "daemon.log")
 MUTEX = "Local\\edge-win7-glass-daemon"
 
 APP_NAME = "Edge Win7 Glass"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 FROZEN = bool(getattr(sys, "frozen", False))   # PyInstaller one-file build (release)
 
 BROWSERS = {"msedge.exe", "chrome.exe", "brave.exe", "vivaldi.exe",

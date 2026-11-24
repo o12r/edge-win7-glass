@@ -206,6 +206,7 @@ class UiaWorker:
         self.lock = threading.Lock()
         self.snap = None
         self.gen = 0
+        self.act = Activity()
 
     def start(self):
         self.gen += 1
@@ -224,7 +225,7 @@ class UiaWorker:
         uia = el = None
         try:
             while self.gen == gen:
-                time.sleep(timing(self.cfg)["fast"])
+                nap(timing(self.cfg)["fast"], self.act, self.hwnd, self.cfg)
                 with self.lock:
                     s = self.snap
                 if not s or not s[0].newtab_r or s[0].win != window_rect(self.hwnd):
@@ -253,6 +254,7 @@ class UiaWorker:
                         with self.lock:
                             if self.snap is s:
                                 self.snap = (new, time.time())
+                                self.act.touch()
                 except Exception as e:
                     el = None
                     dbg(f"uia fast error {e!r}")
@@ -269,10 +271,16 @@ class UiaWorker:
                     snap = self._sample()
                     if self.gen == gen:
                         with self.lock:
+                            old = self.snap
                             self.snap = (snap, time.time())
+                        if old is None or snap_sig(old[0]) != snap_sig(snap):
+                            self.act.touch()
                 except Exception as e:
                     dbg(f"uia error {e!r}")
-                time.sleep(timing(self.cfg)["uia"] if time.time() - t0 < 0.2 else 0.02)
+                if time.time() - t0 < 0.2:
+                    nap(timing(self.cfg)["uia"], self.act, self.hwnd, self.cfg)
+                else:
+                    time.sleep(0.02)
         finally:
             ole32.CoUninitialize()
 
@@ -530,10 +538,64 @@ def timing(cfg):
     return SPEEDS.get(name, SPEEDS["fast"])
 
 
+IDLE_AFTER = 1.5   # s without a layout change / foreground input before a window counts as idle
+IDLE_MULT = 4      # idle windows poll this many times slower
+IDLE_SLICE = 0.025  # idle sleeps are cut into slices so input wakes the poller within ~25 ms
+
+
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("dwTime", wt.DWORD)]
+
+
+def input_age():
+    """Seconds since the last keyboard / mouse input, system-wide (cheap)."""
+    li = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO), 0)
+    if not u32.GetLastInputInfo(ctypes.byref(li)):
+        return 0.0
+    return ((ctypes.windll.kernel32.GetTickCount() - li.dwTime) & 0xFFFFFFFF) / 1000.0
+
+
+class Activity:
+    """Per-window "is anything happening" flag that lets the pollers slow down when idle.
+
+    Active = the layout changed recently, or the user is typing / clicking in this window.
+    A background window with a steady layout is idle and polled IDLE_MULT x slower.
+    """
+
+    def __init__(self):
+        self.changed = time.time()
+
+    def touch(self):
+        self.changed = time.time()
+
+    def active(self, hwnd):
+        if time.time() - self.changed < IDLE_AFTER:
+            return True
+        return (hwnd_int(u32.GetForegroundWindow()) == hwnd_int(hwnd)
+                and input_age() < IDLE_AFTER)
+
+
+def nap(base, act, hwnd, cfg):
+    """sleep(base) while active; while idle sleep base*IDLE_MULT but wake early on activity."""
+    if act is None or not getattr(cfg, "auto_idle", True) or act.active(hwnd):
+        time.sleep(base)
+        return
+    end = time.time() + base * IDLE_MULT
+    while time.time() < end:
+        time.sleep(IDLE_SLICE)
+        if act.active(hwnd):
+            return
+
+
+def snap_sig(s):
+    return (s.win, s.band, s.newtab_r, tuple(tuple(t["rect"]) for t in s.tabs))
+
+
 class Settings:
     """Tunables, read from %APPDATA%\\edge-win7-glass\\settings.json (CLI wins over file)."""
 
     DEFAULTS = {
+        "auto_idle": True,        # slow the pollers down for idle windows (see Activity)
         "speed": "fast",           # eco / balanced / fast: polling intervals (SPEEDS)
         "frame_px": 5,             # CSS px; thin glass frame on all four sides
         "corner_px": 10,           # CSS px; radius of the two top corners of the frame
@@ -1118,7 +1180,7 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
                     trace(f"apply region win={win} cuts={len(cuts)} n={n} r={cr}")
                     pending, pend_n = None, 0
                     log(f"frame {band} tabs={len(snap.tabs)} cuts={len(cuts)}")
-            time.sleep(timing(cfg)["loop"])
+            nap(timing(cfg)["loop"], worker.act, hwnd, cfg)
     except Exception as e:
         log(f"attach loop error {e!r}")
     finally:
