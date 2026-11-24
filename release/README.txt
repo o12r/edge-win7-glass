@@ -1,4 +1,4 @@
-Edge Win7 Glass 1.0.0
+Edge Win7 Glass 1.1.0
 =====================
 
 给 Windows 11 上的 Chromium 系浏览器（Edge / Chrome / Brave / Vivaldi / Chromium /

@@ -200,8 +200,9 @@ def clone_snapshot(snap, win):
 
 
 class UiaWorker:
-    def __init__(self, hwnd):
+    def __init__(self, hwnd, cfg=None):
         self.hwnd = hwnd
+        self.cfg = cfg
         self.lock = threading.Lock()
         self.snap = None
         self.gen = 0
@@ -209,6 +210,54 @@ class UiaWorker:
     def start(self):
         self.gen += 1
         threading.Thread(target=self._run, args=(self.gen,), daemon=True).start()
+        threading.Thread(target=self._fast, args=(self.gen,), daemon=True).start()
+
+    def _fast(self, gen):
+        """Track only the `+` button at ~100 Hz.
+
+        A full sample takes ~200 ms (two FindAll), so opening/closing a tab moved `+` and
+        the hole followed a quarter second late. Reading one cached element's rect is
+        cheap; the result is patched into the latest snapshot immediately.
+        """
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitializeEx(None, 0x2)
+        uia = el = None
+        try:
+            while self.gen == gen:
+                time.sleep(timing(self.cfg)["fast"])
+                with self.lock:
+                    s = self.snap
+                if not s or not s[0].newtab_r or s[0].win != window_rect(self.hwnd):
+                    continue
+                try:
+                    if uia is None:
+                        uia = comtypes.client.CreateObject(UIA.CUIAutomation,
+                                                           interface=UIA.IUIAutomation)
+                    r = None
+                    if el is not None:
+                        try:
+                            r = element_rect(el)
+                        except Exception:
+                            el = None
+                    if el is None:
+                        root = uia.ElementFromHandle(self.hwnd)
+                        cond = uia.CreateAndCondition(
+                            uia.CreatePropertyCondition(UIA.UIA_ControlTypePropertyId, BTN),
+                            uia.CreatePropertyCondition(UIA.UIA_NamePropertyId, "New Tab"))
+                        el = root.FindFirst(UIA.TreeScope_Descendants, cond)
+                        r = element_rect(el) if el else None
+                    if r and r != s[0].newtab_r:
+                        old = s[0]
+                        new = Snapshot(old.win, old.band, old.tabs, old.min_r, old.max_r,
+                                       old.close_r, r, old.search_r)
+                        with self.lock:
+                            if self.snap is s:
+                                self.snap = (new, time.time())
+                except Exception as e:
+                    el = None
+                    dbg(f"uia fast error {e!r}")
+        finally:
+            ole32.CoUninitialize()
 
     def _run(self, gen):
         ole32 = ctypes.windll.ole32
@@ -223,7 +272,7 @@ class UiaWorker:
                             self.snap = (snap, time.time())
                 except Exception as e:
                     dbg(f"uia error {e!r}")
-                time.sleep(0.2 if time.time() - t0 < 0.2 else 0.02)
+                time.sleep(timing(self.cfg)["uia"] if time.time() - t0 < 0.2 else 0.02)
         finally:
             ole32.CoUninitialize()
 
@@ -466,10 +515,26 @@ SETTINGS_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                              "edge-win7-glass", "settings.json")
 
 
+# Polling intervals (seconds) per speed preset: uia = full UIA sample pause, fast = `+` button
+# tracker, loop = attach loop, scan = daemon window scan. "eco" is the pre-optimisation set.
+SPEEDS = {
+    "eco":      {"uia": 0.20, "fast": 0.05, "loop": 0.10, "scan": 1.0},
+    "balanced": {"uia": 0.12, "fast": 0.02, "loop": 0.06, "scan": 0.5},
+    "fast":     {"uia": 0.07, "fast": 0.01, "loop": 0.04, "scan": 0.3},
+}
+
+
+def timing(cfg):
+    """Current interval set; unknown / missing preset falls back to "fast"."""
+    name = str(getattr(cfg, "speed", "fast")) if cfg else "fast"
+    return SPEEDS.get(name, SPEEDS["fast"])
+
+
 class Settings:
     """Tunables, read from %APPDATA%\\edge-win7-glass\\settings.json (CLI wins over file)."""
 
     DEFAULTS = {
+        "speed": "fast",           # eco / balanced / fast: polling intervals (SPEEDS)
         "frame_px": 5,             # CSS px; thin glass frame on all four sides
         "corner_px": 10,           # CSS px; radius of the two top corners of the frame
         "gl_buttons": True,        # hand the top-right corner to OpenGlass caption buttons
@@ -839,7 +904,7 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
     subtracts the top-right corner for OpenGlass' Win7 caption capsules; TouchOverlay turns a
     click on those capsules back into WM_SYSCOMMAND on the browser window.
     """
-    worker = UiaWorker(hwnd)
+    worker = UiaWorker(hwnd, cfg)
     worker.start()
     # The overlay is always created and hidden until it has an area: gl_buttons is a settings
     # value that can be switched at runtime, and a per-window overlay cannot be created from
@@ -1023,9 +1088,12 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
                 # be stable for 3 samples first, otherwise UIA flicker in fullscreen / during
                 # tab animations makes the hole blink.
                 size_changed = applied is not None and applied[0] != key[0]
+                # Hole only slid (tab opened/closed moves `+`): both old and new have a hole,
+                # so there is no appear/disappear flicker to debounce -- apply at once.
+                shifted = bool(applied is not None and applied[3] and rel)
                 pend_n = pend_n + 1 if pending == key else 1
                 pending = key
-                if size_changed or lost or pend_n >= 3:
+                if size_changed or lost or shifted or pend_n >= 2:
                     # Edge's visible content starts at its client left edge (the window rect
                     # has an invisible resize border), so the left arc must start there or
                     # the content clips it into a flat ellipse.
@@ -1050,7 +1118,7 @@ def attach_loop(hwnd, cfg, scale, stop_event=None, log=print):
                     trace(f"apply region win={win} cuts={len(cuts)} n={n} r={cr}")
                     pending, pend_n = None, 0
                     log(f"frame {band} tabs={len(snap.tabs)} cuts={len(cuts)}")
-            time.sleep(0.1)
+            time.sleep(timing(cfg)["loop"])
     except Exception as e:
         log(f"attach loop error {e!r}")
     finally:

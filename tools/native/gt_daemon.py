@@ -43,7 +43,7 @@ LOG_PATH = os.path.join(APP_DATA, "daemon.log")
 MUTEX = "Local\\edge-win7-glass-daemon"
 
 APP_NAME = "Edge Win7 Glass"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 FROZEN = bool(getattr(sys, "frozen", False))   # PyInstaller one-file build (release)
 
 BROWSERS = {"msedge.exe", "chrome.exe", "brave.exe", "vivaldi.exe",
@@ -209,6 +209,8 @@ class NOTIFYICONDATAW(ctypes.Structure):
 
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 1, 2, 4
 MF_STRING, MF_CHECKED, MF_SEPARATOR, MF_GRAYED = 0, 8, 0x800, 1
+MF_POPUP = 0x10
+SPEED_IDS = {41: "eco", 42: "balanced", 43: "fast"}
 TPM_RETURNCMD, TPM_RIGHTBUTTON = 0x100, 0x02
 WM_COMMAND, WM_DESTROY = 0x0111, 0x0002
 WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM)
@@ -223,11 +225,15 @@ class WNDCLASS(ctypes.Structure):
 
 # (command id, i18n key) -- a `None` key draws a separator.
 MENU_ITEMS = [
+    (3, "menu_version"),        # greyed-out label: "Edge Win7 Glass v<APP_VERSION>"
+    (5, None),
     (1, "menu_settings"),
     (2, None),
     (20, "menu_pause"),
     (21, "menu_autostart"),
+    (40, "menu_speed"),         # submenu: eco / balanced / fast (ids 41-43)
     (4, None),
+    (31, "menu_restart"),
     (30, "menu_quit"),
 ]
 
@@ -287,6 +293,16 @@ class Tray:
                 continue
             flags = MF_STRING
             text = i18n.t(self.d.lang, key)
+            if mid == 40:
+                sub = u32.CreatePopupMenu()
+                for sid, name in SPEED_IDS.items():
+                    u32.AppendMenuW(sub, MF_STRING | (MF_CHECKED if self.d.cfg.speed == name else 0),
+                                    sid, i18n.t(self.d.lang, "speed_" + name))
+                u32.AppendMenuW(m, MF_STRING | MF_POPUP, sub, text)   # m owns/destroys sub
+                continue
+            if mid == 3:
+                text = i18n.t(self.d.lang, key).format(name=APP_NAME, v=APP_VERSION)
+                flags |= MF_GRAYED
             if mid == 20:
                 text = i18n.t(self.d.lang, "menu_resume" if paused else "menu_pause")
                 flags |= MF_CHECKED if paused else 0
@@ -478,7 +494,24 @@ class Daemon:
             self.apply_settings({"autostart": not autostart_state()})
         elif cid == 30:
             self.quit()
+        elif cid == 31:
+            self.restart()
+        elif cid in SPEED_IDS:
+            self.apply_settings({"speed": SPEED_IDS[cid]})
         self.refresh_tip()
+
+    def restart(self):
+        """Start a fresh copy, then quit. The new one waits for our mutex (see run())."""
+        args = [sys.executable] + ([] if FROZEN else [os.path.abspath(sys.argv[0])]) + sys.argv[1:]
+        env = dict(os.environ, GT_RESTART="1", PYINSTALLER_RESET_ENVIRONMENT="1")
+        log(f"restart: {args}")
+        try:
+            subprocess.Popen(args, env=env, creationflags=0x08000000 | 0x00000008,   # NO_WINDOW | DETACHED
+                             close_fds=True)
+        except Exception as e:
+            log(f"restart failed: {e!r}")
+            return
+        self.quit()
 
     def open_settings(self):
         url = f"http://127.0.0.1:{self.http_port}/"
@@ -519,6 +552,14 @@ class Daemon:
     # ---------------- lifecycle
     def run(self):
         mutex = k32.CreateMutexW(None, False, MUTEX)
+        if k32.GetLastError() == 183 and os.environ.get("GT_RESTART"):
+            # Spawned by the tray "Restart": the old instance is still exiting, wait for it.
+            for _ in range(50):
+                time.sleep(0.1)
+                k32.CloseHandle(mutex)
+                mutex = k32.CreateMutexW(None, False, MUTEX)
+                if k32.GetLastError() != 183:
+                    break
         if k32.GetLastError() == 183:              # ERROR_ALREADY_EXISTS
             log("already running; opening settings page")
             try:
@@ -550,7 +591,7 @@ class Daemon:
                 self.scan()
             except Exception as e:
                 log(f"scan error {e!r}")
-            time.sleep(1.0)
+            time.sleep(gt.timing(self.cfg)["scan"])
 
     def quit(self):
         log("quit")
