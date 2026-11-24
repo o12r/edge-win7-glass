@@ -43,7 +43,7 @@ LOG_PATH = os.path.join(APP_DATA, "daemon.log")
 MUTEX = "Local\\edge-win7-glass-daemon"
 
 APP_NAME = "Edge Win7 Glass"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 FROZEN = bool(getattr(sys, "frozen", False))   # PyInstaller one-file build (release)
 
 BROWSERS = {"msedge.exe", "chrome.exe", "brave.exe", "vivaldi.exe",
@@ -528,7 +528,9 @@ class Daemon:
         return {"port": self.http_port, "paused": self.paused,
                 "autostart": autostart_state(), "windows": wins,
                 "lang": self.lang, "auto_lang": i18n.system_lang(),
-                "settings": self.cfg.data}
+                "settings": self.cfg.data,
+                "speeds": {k: {n: int(round(x * 1000)) for n, x in v.items()}
+                           for k, v in gt.SPEEDS.items()}}
 
     # ---------------- http
     def start_http(self):
@@ -715,6 +717,25 @@ PAGE = r"""<!doctype html><html lang="__HTML_LANG__" class="pending"><meta chars
   <h2 data-i18n="sec_daemon">守护</h2>
   <div class="row"><label><span data-i18n="autostart"></span><div class="hint" data-i18n="autostart_hint"></div></label>
    <input type="checkbox" id="autostart"></div>
+  <div class="row"><label><span data-i18n="speed"></span><div class="hint" data-i18n="speed_hint"></div></label>
+   <select id="speed">
+    <option value="eco" data-i18n="speed_eco"></option>
+    <option value="balanced" data-i18n="speed_balanced"></option>
+    <option value="fast" data-i18n="speed_fast"></option>
+    <option value="custom" data-i18n="speed_custom"></option>
+   </select></div>
+  <div class="row"><label><span data-i18n="auto_idle"></span><div class="hint" data-i18n="auto_idle_hint"></div></label>
+   <input type="checkbox" id="auto_idle"></div>
+  <div class="row"><label><span data-i18n="adv"></span><div class="hint" data-i18n="adv_hint"></div></label>
+   <input type="checkbox" id="adv"></div>
+  <div id="advbox" style="display:none">
+   <div class="row"><label><span data-i18n="t_uia"></span></label><input type="number" id="t_uia" min="20" max="2000" step="5"></div>
+   <div class="row"><label><span data-i18n="t_fast"></span></label><input type="number" id="t_fast" min="5" max="1000" step="1"></div>
+   <div class="row"><label><span data-i18n="t_loop"></span></label><input type="number" id="t_loop" min="10" max="1000" step="5"></div>
+   <div class="row"><label><span data-i18n="t_scan"></span></label><input type="number" id="t_scan" min="100" max="5000" step="50"></div>
+   <div class="row"><label><span data-i18n="idle_after_ms"></span></label><input type="number" id="idle_after_ms" min="200" max="30000" step="100"></div>
+   <div class="row"><label><span data-i18n="idle_mult"></span></label><input type="number" id="idle_mult" min="1" max="20" step="1"></div>
+  </div>
   <div class="row"><label><span data-i18n="port"></span></label><input type="number" id="port" min="1024" max="65535"></div>
  </div>
 
@@ -731,7 +752,7 @@ PAGE = r"""<!doctype html><html lang="__HTML_LANG__" class="pending"><meta chars
 <div id="toast"></div>
 <script>
 const I18N=__I18N__;
-const F=['frame_px','corner_px','gl_buttons','btn_pad_right_px','btn_min_px','btn_close_px','btn_top_px','btn_h_px','btn_h_fix_px','lang','autostart','port'];
+const F=['frame_px','corner_px','gl_buttons','btn_pad_right_px','btn_min_px','btn_close_px','btn_top_px','btn_h_px','btn_h_fix_px','lang','autostart','port','speed','auto_idle','t_uia','t_fast','t_loop','t_scan','idle_after_ms','idle_mult'];
 let setting='__LANG_SETTING__', sysLang='__LANG__', lang='__LANG__', last=null, touched=false;
 function T(k){const d=I18N[lang]||I18N.en;return d[k]!==undefined?d[k]:(I18N.en[k]!==undefined?I18N.en[k]:k);}
 function FMT(k,a){return T(k).replace(/\{(\w+)\}/g,(m,g)=>a[g]!==undefined?a[g]:m);}
@@ -761,8 +782,17 @@ async function load(fill=true){
   lang = setting==='auto'? sysLang : setting;
   if(fill && !touched) for(const k of F){const el=document.getElementById(k);if(!el)continue;
     if(el.type==='checkbox')el.checked=!!s[k];else el.value=s[k];}
+  if(fill && !touched && s.speed!=='custom' && j.speeds && j.speeds[s.speed])
+    for(const k of ['uia','fast','loop','scan'])document.getElementById('t_'+k).value=j.speeds[s.speed][k];
   applyI18n();
 }
+const TK=['uia','fast','loop','scan'];
+function showAdv(){document.getElementById('advbox').style.display=document.getElementById('adv').checked?'block':'none';}
+document.getElementById('adv').checked=localStorage.getItem('gt_adv')==='1';showAdv();
+document.getElementById('adv').onchange=()=>{localStorage.setItem('gt_adv',document.getElementById('adv').checked?'1':'0');showAdv();};
+document.getElementById('speed').onchange=e=>{touched=true;const p=last&&last.speeds&&last.speeds[e.target.value];
+  if(p)for(const k of TK)document.getElementById('t_'+k).value=p[k];};
+for(const k of TK.map(x=>'t_'+x))document.getElementById(k).oninput=()=>{touched=true;document.getElementById('speed').value='custom';};
 document.getElementById('lang').onchange=e=>{
   touched=true; setting=e.target.value; lang = setting==='auto'? sysLang : setting; applyI18n();
 };

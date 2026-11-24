@@ -525,6 +525,8 @@ SETTINGS_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
 
 # Polling intervals (seconds) per speed preset: uia = full UIA sample pause, fast = `+` button
 # tracker, loop = attach loop, scan = daemon window scan. "eco" is the pre-optimisation set.
+# Allowed range (ms) of the custom per-interval values (speed == "custom").
+CUSTOM_RANGE = {"uia": (20, 2000), "fast": (5, 1000), "loop": (10, 1000), "scan": (100, 5000)}
 SPEEDS = {
     "eco":      {"uia": 0.20, "fast": 0.05, "loop": 0.10, "scan": 1.0},
     "balanced": {"uia": 0.12, "fast": 0.02, "loop": 0.06, "scan": 0.5},
@@ -535,7 +537,29 @@ SPEEDS = {
 def timing(cfg):
     """Current interval set; unknown / missing preset falls back to "fast"."""
     name = str(getattr(cfg, "speed", "fast")) if cfg else "fast"
+    if name == "custom":
+        out = {}
+        for k, (lo, hi) in CUSTOM_RANGE.items():
+            try:
+                ms = float(getattr(cfg, "t_" + k))
+            except Exception:
+                ms = SPEEDS["fast"][k] * 1000
+            out[k] = min(hi, max(lo, ms)) / 1000.0
+        return out
     return SPEEDS.get(name, SPEEDS["fast"])
+
+
+def idle_params(cfg):
+    """(idle_after seconds, idle multiplier), clamped; defaults when cfg is missing."""
+    try:
+        after = min(30.0, max(0.2, float(cfg.idle_after_ms) / 1000.0))
+    except Exception:
+        after = IDLE_AFTER
+    try:
+        mult = min(20.0, max(1.0, float(cfg.idle_mult)))
+    except Exception:
+        mult = IDLE_MULT
+    return after, mult
 
 
 IDLE_AFTER = 1.5   # s without a layout change / foreground input before a window counts as idle
@@ -568,22 +592,26 @@ class Activity:
     def touch(self):
         self.changed = time.time()
 
-    def active(self, hwnd):
-        if time.time() - self.changed < IDLE_AFTER:
+    def active(self, hwnd, after=IDLE_AFTER):
+        if time.time() - self.changed < after:
             return True
         return (hwnd_int(u32.GetForegroundWindow()) == hwnd_int(hwnd)
-                and input_age() < IDLE_AFTER)
+                and input_age() < after)
 
 
 def nap(base, act, hwnd, cfg):
     """sleep(base) while active; while idle sleep base*IDLE_MULT but wake early on activity."""
-    if act is None or not getattr(cfg, "auto_idle", True) or act.active(hwnd):
+    if act is None or not getattr(cfg, "auto_idle", True):
         time.sleep(base)
         return
-    end = time.time() + base * IDLE_MULT
+    after, mult = idle_params(cfg)
+    if act.active(hwnd, after):
+        time.sleep(base)
+        return
+    end = time.time() + base * mult
     while time.time() < end:
         time.sleep(IDLE_SLICE)
-        if act.active(hwnd):
+        if act.active(hwnd, after):
             return
 
 
@@ -596,6 +624,12 @@ class Settings:
 
     DEFAULTS = {
         "auto_idle": True,        # slow the pollers down for idle windows (see Activity)
+        "idle_after_ms": 1500,     # advanced: layout steady this long -> window counts as idle
+        "idle_mult": 4,            # advanced: idle windows poll this many times slower
+        "t_uia": 70,               # advanced (speed=custom), ms: pause between full UIA samples
+        "t_fast": 10,              # advanced (speed=custom), ms: `+` button tracker
+        "t_loop": 40,              # advanced (speed=custom), ms: attach loop
+        "t_scan": 300,             # advanced (speed=custom), ms: daemon window scan
         "speed": "fast",           # eco / balanced / fast: polling intervals (SPEEDS)
         "frame_px": 5,             # CSS px; thin glass frame on all four sides
         "corner_px": 10,           # CSS px; radius of the two top corners of the frame
